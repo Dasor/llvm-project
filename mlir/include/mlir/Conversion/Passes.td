@@ -1767,4 +1767,49 @@ def ConvertXeGPUToXeVMPass : Pass<"convert-xegpu-to-xevm"> {
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// ToRISCV
+//===----------------------------------------------------------------------===//
+
+def ConvertToRISCVPass : Pass<"convert-to-riscv", "mlir::ModuleOp"> {
+  let summary = "Compile snitch.memref.microkernel bodies to RISC-V assembly via xDSL";
+  let description = [{
+    Extracts the body of every `snitch.memref.microkernel` op, hands it to the
+    `xdsl-opt` tool as a subprocess to be compiled down to Snitch-stream
+    RISC-V assembly, and replaces the microkernel with a
+    `snitch.call_microkernel` referencing the produced assembly text.
+  }];
+
+  let options = [
+    Option<"xDSLOptPath", "xdsl-opt-path", "std::string", [{""}],
+      "Path to the 'xdsl-opt' executable to use for kernel compilation.">,
+    Option<"assertCompiled", "assert-compiled", "bool", "false",
+           "If true, errors if any kernel could not be compiled with xDSL."
+           "Otherwise, removes the kernel from the output and emits a warning "
+           "instead.">,
+  ];
+
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// DMAToLLVM
+//===----------------------------------------------------------------------===//
+
+def ConvertDMAToLLVMPass : Pass<"convert-dma-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Convert the dma and snitch_dma dialects to LLVM";
+  let dependentDialects = ["LLVM::LLVMDialect", "snitch_dma::SnitchDMADialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// SnitchToLLVM
+//===----------------------------------------------------------------------===//
+
+def ConvertSnitchToLLVMPass : Pass<"convert-snitch-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Convert the snitch dialect to LLVM";
+  let dependentDialects = ["LLVM::LLVMDialect"];
+}
+
 #endif // MLIR_CONVERSION_PASSES

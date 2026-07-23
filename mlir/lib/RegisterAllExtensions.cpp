@@ -38,6 +38,7 @@
 #include "mlir/Dialect/Bufferization/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Bufferization/TransformOps/BufferizationTransformOps.h"
 #include "mlir/Dialect/DLTI/TransformOps/DLTITransformOps.h"
+#include "mlir/Dialect/DMA/Extensions/DMACoreSpecializationOpInterfaceImpl.h"
 #include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/TransformOps/FuncTransformOps.h"
 #include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
@@ -74,6 +75,7 @@ void mlir::registerAllExtensions(DialectRegistry &registry) {
   registerConvertArithToEmitCInterface(registry);
   arith::registerConvertArithToLLVMInterface(registry);
   bufferization::registerAllExtensions(registry);
+  dma::registerDMACoreSpecializationOpInterface(registry);
   registerConvertComplexToLLVMInterface(registry);
   cf::registerConvertControlFlowToLLVMInterface(registry);
   func::registerAllExtensions(registry);

@@ -1,0 +1,12 @@
+#ifndef MLIR_DIALECT_DMA_EXTENSIONS_DMACORESPECIALIZATIONOPINTERFACEIMPL_H
+#define MLIR_DIALECT_DMA_EXTENSIONS_DMACORESPECIALIZATIONOPINTERFACEIMPL_H
+
+namespace mlir {
+class DialectRegistry;
+}
+
+namespace mlir::dma {
+void registerDMACoreSpecializationOpInterface(mlir::DialectRegistry &registry);
+}
+
+#endif // MLIR_DIALECT_DMA_EXTENSIONS_DMACORESPECIALIZATIONOPINTERFACEIMPL_H

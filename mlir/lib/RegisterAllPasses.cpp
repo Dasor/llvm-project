@@ -38,6 +38,8 @@
 #include "mlir/Dialect/Quant/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
+#include "mlir/Dialect/Snitch/Transforms/Passes.h"
+#include "mlir/Dialect/SnitchDMA/Transforms/Passes.h"
 #include "mlir/Dialect/Shape/Transforms/Passes.h"
 #include "mlir/Dialect/Shard/Transforms/Passes.h"
 #include "mlir/Dialect/SparseTensor/Pipelines/Passes.h"
@@ -86,6 +88,8 @@ void mlir::registerAllPasses() {
   omp::registerOpenMPPasses();
   quant::registerQuantPasses();
   registerSCFPasses();
+  snitch::registerSnitchPasses();
+  snitch_dma::registerSnitchDMAPasses();
   registerShapePasses();
   spirv::registerSPIRVPasses();
   tensor::registerTensorPasses();

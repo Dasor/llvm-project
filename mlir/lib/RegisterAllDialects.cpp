@@ -34,6 +34,7 @@
 #include "mlir/Dialect/ControlFlow/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/ControlFlow/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/DMA/IR/DMADialect.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -68,6 +69,8 @@
 #include "mlir/Dialect/PDLInterp/IR/PDLInterp.h"
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Quant/IR/Quant.h"
+#include "mlir/Dialect/Snitch/IR/SnitchDialect.h"
+#include "mlir/Dialect/SnitchDMA/IR/SnitchDMADialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
@@ -123,6 +126,7 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
                   cf::ControlFlowDialect,
                   complex::ComplexDialect,
                   DLTIDialect,
+                  dma::DMADialect,
                   emitc::EmitCDialect,
                   func::FuncDialect,
                   gpu::GPUDialect,
@@ -133,6 +137,8 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
                   math::MathDialect,
                   memref::MemRefDialect,
                   shard::ShardDialect,
+                  snitch::SnitchDialect,
+                  snitch_dma::SnitchDMADialect,
                   ml_program::MLProgramDialect,
                   mpi::MPIDialect,
                   nvgpu::NVGPUDialect,
