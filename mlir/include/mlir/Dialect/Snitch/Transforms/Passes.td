@@ -78,4 +78,43 @@ def SpecializeDMACodePass : Pass<"snitch-specialize-dma-code",
   ];
 }
 
+def EliminateEmptyTensorsPass
+  : InterfacePass<"snitch-eliminate-empty-tensors", "mlir::FunctionOpInterface"> {
+  let description = [{
+    Rewrites `tensor.empty` ops that are anchored on a destination-passing-style
+    consumer to reuse that consumer's destination tensor instead, ahead of
+    bufferization.
+  }];
+
+  let dependentDialects = [
+    "mlir::bufferization::BufferizationDialect",
+  ];
+}
+
+def BufferizePass : Pass<"snitch-bufferize", "mlir::ModuleOp"> {
+  let description = [{
+    Bufferizes the module using upstream One-Shot Bufferize, including
+    function boundaries (with a static identity layout, since the exported
+    functions must remain callable with a plain C ABI / xDSL's bare-pointer
+    calling convention).
+
+    When `use-dma-memcpy` is set, buffers are allocated with `memref.alloca`
+    (suitable for the small, statically sized L1 scratchpad) and copies between
+    buffers are lowered to `dma.start_transfer`/`dma.wait_for_transfer` pairs
+    instead of the default `memref.alloc`/`linalg.copy`.
+  }];
+
+  let options = [
+    Option<"useDMAMemcpy", "use-dma-memcpy", "bool", "false",
+           "Allocate with memref.alloca and copy via the DMA dialect instead "
+           "of the upstream defaults.">,
+  ];
+
+  let dependentDialects = [
+    "mlir::bufferization::BufferizationDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::dma::DMADialect",
+  ];
+}
+
 #endif

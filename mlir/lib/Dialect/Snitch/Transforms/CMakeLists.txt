@@ -1,4 +1,5 @@
 add_mlir_dialect_library(MLIRSnitchTransforms
+  Bufferize.cpp
   FormMicrokernels.cpp
   LowerL1Allocations.cpp
   PromoteToL1.cpp
@@ -17,8 +18,10 @@ add_mlir_dialect_library(MLIRSnitchTransforms
   MLIRAffineDialect
   MLIRArithDialect
   MLIRBufferizationDialect
+  MLIRBufferizationTransforms
   MLIRFunctionInterfaces
   MLIRLinalgDialect
+  MLIRLinalgTransforms
   MLIRMemRefDialect
   MLIRPass
   MLIRTensorDialect
