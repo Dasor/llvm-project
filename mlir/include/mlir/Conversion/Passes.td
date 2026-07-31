@@ -1810,6 +1810,13 @@ def ConvertDMAToLLVMPass : Pass<"convert-dma-to-llvm", "mlir::ModuleOp"> {
 def ConvertSnitchToLLVMPass : Pass<"convert-snitch-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert the snitch dialect to LLVM";
   let dependentDialects = ["LLVM::LLVMDialect"];
+  let options = [
+    Option<"barrierParticipants", "barrier-participants", "unsigned", "2",
+           "Number of harts participating in each lowered snitch.barrier "
+           "rendezvous. SpecializeDMACode currently only ever produces a "
+           "compute-core clone and a DM-core clone synchronizing with each "
+           "other, so this defaults to 2.">,
+  ];
 }
 
 #endif // MLIR_CONVERSION_PASSES

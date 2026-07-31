@@ -12,5 +12,6 @@ class RewritePatternSet;
 
 void populateSnitchToLLVMConversionPatterns(mlir::ModuleOp moduleOp,
                                             mlir::LLVMTypeConverter &converter,
-                                            mlir::RewritePatternSet &patterns);
+                                            mlir::RewritePatternSet &patterns,
+                                            unsigned barrierParticipants = 2);
 } // namespace mlir

@@ -117,4 +117,57 @@ def BufferizePass : Pass<"snitch-bufferize", "mlir::ModuleOp"> {
   ];
 }
 
+def PipelineCopyComputePass : Pass<"snitch-pipeline-copy-compute"> {
+  let description = [{
+    Finds `scf.for` loops whose tiled compute op is marked with the
+    `snitch.dual_buffer` unit attribute (attached by the tiling schedule,
+    e.g. via `transform.annotate`) and lifts them into a two-stage
+    `snitch.pipeline` (copy stage, compute stage) so a later
+    `snitch-lower-pipeline-op` can expand it into a software-pipelined
+    on-ramp/steady-state/off-ramp loop nest. Operates at the tensor level,
+    before bufferization.
+  }];
+
+  let dependentDialects = [
+    "mlir::snitch::SnitchDialect",
+    "mlir::dma::DMADialect",
+  ];
+}
+
+def LowerForallOpPass : Pass<"snitch-lower-forall-op"> {
+  let description = [{
+    Converts a single-induction-variable `scf.forall` (as produced by
+    thread-level tiling, e.g. `transform.structured.tile_using_forall`) into
+    a strided `scf.for` where hart `id` processes iterations
+    `id, id+compute_cores, id+2*compute_cores, ...`, using
+    `snitch.compute_core_index` to determine `id`. Operates at the memref
+    level, after bufferization.
+  }];
+
+  let options = [
+    Option<"computeCores", "compute-cores", "unsigned", "8",
+           "Number of compute cores (harts) to distribute forall iterations "
+           "across.">,
+  ];
+
+  let dependentDialects = [
+    "mlir::snitch::SnitchDialect",
+  ];
+}
+
+def LowerPipelineOpPass : Pass<"snitch-lower-pipeline-op"> {
+  let description = [{
+    Expands memref-semantics `snitch.pipeline` ops into the concrete
+    on-ramp/steady-state/off-ramp `scf.for` nest, duplicating any
+    `memref.alloca`s used by more than one stage so consecutive iterations
+    of different stages can execute concurrently. Tensor-semantics
+    `snitch.pipeline` ops (not yet bufferized) are left untouched. Operates
+    at the memref level, after `snitch-lower-l1-allocations`.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+  ];
+}
+
 #endif

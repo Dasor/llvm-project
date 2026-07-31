@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Snitch/IR/SnitchDialect.h"
 
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Snitch/IR/SnitchDialect.cpp.inc"
 #include "mlir/Dialect/Snitch/IR/SnitchAttrs.h"
 #include "mlir/Dialect/Snitch/IR/SnitchOps.h"

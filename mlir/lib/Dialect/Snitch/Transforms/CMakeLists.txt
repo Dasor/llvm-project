@@ -1,7 +1,10 @@
 add_mlir_dialect_library(MLIRSnitchTransforms
   Bufferize.cpp
   FormMicrokernels.cpp
+  LowerForallOp.cpp
   LowerL1Allocations.cpp
+  LowerPipelineOp.cpp
+  PipelineCopyCompute.cpp
   PromoteToL1.cpp
   SpecializeDMACode.cpp
 
@@ -16,6 +19,7 @@ add_mlir_dialect_library(MLIRSnitchTransforms
   MLIRSnitchDialect
   MLIRIR
   MLIRAffineDialect
+  MLIRAnalysis
   MLIRArithDialect
   MLIRBufferizationDialect
   MLIRBufferizationTransforms
@@ -24,6 +28,7 @@ add_mlir_dialect_library(MLIRSnitchTransforms
   MLIRLinalgTransforms
   MLIRMemRefDialect
   MLIRPass
+  MLIRSCFDialect
   MLIRTensorDialect
   MLIRTilingInterface
   MLIRUBDialect
