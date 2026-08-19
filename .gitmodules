@@ -1,0 +1,6 @@
+[submodule "snitch-backend/gvsoc"]
+	path = snitch-backend/gvsoc
+	url = https://github.com/gvsoc/gvsoc
+[submodule "snitch-backend/xdsl"]
+	path = snitch-backend/xdsl
+	url = https://github.com/xdslproject/xdsl

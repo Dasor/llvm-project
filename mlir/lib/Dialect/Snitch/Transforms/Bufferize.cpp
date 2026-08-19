@@ -70,8 +70,15 @@ struct BufferizePass
 
     OneShotBufferizationOptions options = getBufferizationOptions();
     // Turning this off assumes we are not relying on bufferization being
-    // conservative around parallel regions (e.g. `scf.forall`). Revisit if
-    // dual-buffered pipelining (Milestone 4) exposes a data race here.
+    // conservative around parallel regions (e.g. `scf.forall`). Milestone 5
+    // was the first to actually exercise an `scf.forall` here (verified by
+    // hand: disjoint per-hart subview offsets), and Milestone 6 combined it
+    // with dual-buffered pipelining - an `scf.forall` nested inside a
+    // `snitch.pipeline` compute stage - also verified by hand to bufferize
+    // without introducing aliasing between hart slices or between pipeline
+    // stages. No race found in either case, but neither is caught by
+    // tooling; re-verify by hand (grep for disjoint subview offsets/strides)
+    // if this bufferization is touched again.
     options.checkParallelRegions = false;
     // Unlike IREE (which converts dispatch region signatures to memrefs via
     // its own HAL ABI before this point), we bufferize function signatures

@@ -1,0 +1,18 @@
+services:
+  snitch:
+    build:
+      context: .
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+        LLVM_PROJECT_DIR: "${LLVM_PROJECT_DIR:?set LLVM_PROJECT_DIR in a .env file -- see README}"
+    image: snitch-backend:dev
+    volumes:
+      - ${LLVM_PROJECT_DIR:?set LLVM_PROJECT_DIR in a .env file -- see README}:${LLVM_PROJECT_DIR}
+      - ccache:/home/dev/.ccache
+    working_dir: ${LLVM_PROJECT_DIR}/snitch-backend
+    tty: true
+    stdin_open: true
+
+volumes:
+  ccache: {}
