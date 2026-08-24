@@ -117,9 +117,7 @@ class SnitchGemmKnobFeatureExtractor(KnobFeatureExtractor):
 def snitch_tile_constraint(dims: Dict[str, int]):
     """Build the constraint function KnobSearchSpace uses as the sole
     authority on candidate validity (see its docstring) for the Snitch M6
-    schedule. Three requirements, all load-bearing, not stylistic --
-    the third was found empirically while verifying this tuner, not
-    predicted in advance, see below.
+    schedule. Two requirements, both load-bearing, not stylistic.
 
     1. tile_m, tile_n, tile_k must each evenly divide dims['M']/['N']/['K'].
        A non-divisor tile size exercises PromotePadsToL1's padding path which is untested
@@ -127,61 +125,108 @@ def snitch_tile_constraint(dims: Dict[str, int]):
     2. tile_m must additionally be a multiple of 8 since we have 8 cores
        and the schedule's outermost M-loop is parallelized across all of them.
        Else it will create uneven work that can result into a deadlock.
-       
-    3. tile_n must equal dims['N'] // 2 (a pipeline trip count of exactly
-       2). This is caused by LoopPipelining's current implementation of the "dual-buffered" pipeline.
     """
 
     def constraint(values: Dict[str, object]) -> bool:
         m, n, k = int(values["tile_m"]), int(values["tile_n"]), int(values["tile_k"])
         if dims["M"] % m or dims["N"] % n or dims["K"] % k:
             return False
-        if m % 8 != 0:
-            return False
-        return n == dims["N"] // 2
+        return m % 8 == 0
 
     return constraint
 
 
-def _knob_option_pool(name: str, dims: Dict[str, int]) -> List[int]:
-    """The Python-side candidate pool for one knob -- factored out so
-    snitch_divisor_sample_value (which draws from it) and
-    snitch_search_space_size (which counts it) can't drift apart."""
+def _divisors(n: int) -> List[int]:
+    """All positive divisors of n, ascending -- mirrors
+    ../mlir_tuner/run_gbdt_tuner.py's divisors() for the CPU backend."""
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def max_l1_tile_dim(elem_bytes: int) -> int:
+    budget = L1_BYTES // 2  # /2 for headroom under the dual-buffered 2x
+    # dual-buffered footprint ~= 2 * (t*t + t*t + t*t) * elem_bytes = 6*t^2*elem_bytes
+    return max(1, int((budget / (3 * elem_bytes)) ** 0.5))
+
+
+def _knob_option_pool(name: str, dims: Dict[str, int], elem_bytes: int) -> List[int]:
+    """
+    Candidate pool for the pipelined mode's knobs
+    """
     dim = dims[_KNOB_DIM_NAME[name]]
+    divs = _divisors(dim)
+    max_tile = max_l1_tile_dim(elem_bytes)
+
     if name == "tile_m":
-        options = [8, 16, 32]
-    elif name == "tile_n":
-        options = [dim // 2]
-    else:
-        options = [4, 8, 16, 32]
-    return [d for d in options if dim % d == 0]
+        pool = [d for d in divs if d % 8 == 0 and d <= max_tile]
+        return pool or [d for d in divs if d % 8 == 0]
+
+    min_tile = max(1, -(-dim // 8))  # ceil(dim / 8)
+    pool = [d for d in divs if min_tile <= d <= max_tile]
+    if pool:
+        return pool
+    pool = [d for d in divs if d <= max_tile]
+    return pool or divs
 
 
-def snitch_divisor_sample_value(name: str, rng, dims: Dict[str, int]) -> str:
+def snitch_divisor_sample_value(name: str, rng, dims: Dict[str, int], elem_bytes: int) -> str:
     """ Provide a random (from a pool of good options)
     valid divisor of the corresponding dimension for the given knob name."""
-    valid = _knob_option_pool(name, dims)
+    valid = _knob_option_pool(name, dims, elem_bytes)
     if not valid:
         raise ValueError(f"no valid options for knob {name!r} against dimension {dims[_KNOB_DIM_NAME[name]]}")
     return str(rng.choice(valid))
 
 
-def snitch_search_space_size(dims: Dict[str, int]) -> int:
+def snitch_search_space_size(dims: Dict[str, int], elem_bytes: int) -> int:
     """Total number of distinct valid (tile_m, tile_n, tile_k) combinations
-    that exist for this payload's dims -- deliberately tiny by construction
-    (tile_n is pinned to a singleton, see snitch_tile_constraint's
-    docstring). run_gbdt_tuner.py clamps --init-samples/--ga-population/
-    --ga-candidates-per-iter to this number: tuner_framework.Tuner's
-    _propose_via_ga() fills its GA population with
-    `while len(pop) < ga_population: ... sample_random() ...`, which never
-    terminates once every valid candidate is already in the population and
-    ga_population was requested higher than the number of valid candidates
-    that actually exist -- a genuine infinite loop (not just a slow one),
-    since sample_random() has no way to invent a 13th distinct valid
-    combination on demand."""
+    that exist for this payload's dims/element size. 
+    """
     size = 1
     for name in _KNOB_DIM_NAME:
-        size *= len(_knob_option_pool(name, dims))
+        size *= len(_knob_option_pool(name, dims, elem_bytes))
+    return size
+
+
+def snitch_padded_tile_constraint(dims: Dict[str, int]):
+    """Constraint function for the non-pipelined, padded mode"""
+
+    def constraint(values: Dict[str, object]) -> bool:
+        m = int(values["tile_m"])
+        return m % 8 == 0
+
+    return constraint
+
+
+def _padded_knob_option_pool(name: str, dims: Dict[str, int], elem_bytes: int) -> List[int]:
+    """Candidate pool for the padded mode's knobs """
+    dim = dims[_KNOB_DIM_NAME[name]]
+    upper = max(1, min(dim, max_l1_tile_dim(elem_bytes)))
+
+    if name == "tile_m":
+        pool = list(range(8, upper + 1, 8))
+        return pool or [8]
+
+    lower = max(4, min(upper, -(-dim // 8)))  # same ceil(dim/8) floor heuristic as the divisor mode
+    if lower > upper:
+        lower = upper
+    return list(range(lower, upper + 1))
+
+
+def snitch_padded_tile_sample_value(name: str, rng, dims: Dict[str, int], elem_bytes: int) -> str:
+    """Sample a tile size for the padded mode -- any integer in range, not
+    restricted to divisors."""
+    valid = _padded_knob_option_pool(name, dims, elem_bytes)
+    if not valid:
+        raise ValueError(f"no valid options for knob {name!r} against dimension {dims[_KNOB_DIM_NAME[name]]}")
+    return str(rng.choice(valid))
+
+
+def snitch_padded_search_space_size(dims: Dict[str, int], elem_bytes: int) -> int:
+    """Total number of distinct valid (tile_m, tile_n, tile_k) combinations
+    for the padded mode -- same purpose as snitch_search_space_size."""
+    size = 1
+    for name in _KNOB_DIM_NAME:
+        size *= len(_padded_knob_option_pool(name, dims, elem_bytes))
     return size
 
 
@@ -190,8 +235,8 @@ _CYCLES_RE = re.compile(r"total_cycles:\s*(\d+)")
 
 
 class SnitchScheduleEvaluator(Evaluator):
-    """ 
-    Evaluator for the Snitch schedule. It compiles the schedule with the given knobs, runs it in gvsoc, 
+    """
+    Evaluator for the Snitch schedule. It compiles the schedule with the given knobs, runs it in gvsoc,
     and extracts the cycle count from the output.
     """
 
@@ -199,12 +244,14 @@ class SnitchScheduleEvaluator(Evaluator):
         self,
         schedule_text: str,
         run_script: Path,
+        payload_path: Path,
         timeout_s: float = 300.0,
         verbose: bool = False,
         cleanup: bool = True,
     ):
         self.schedule_text = schedule_text
         self.run_script = run_script
+        self.payload_path = Path(payload_path).resolve()
         self.timeout_s = timeout_s
         self.verbose = verbose
         self.cleanup = cleanup
@@ -247,7 +294,7 @@ class SnitchScheduleEvaluator(Evaluator):
 
     def _run_once(self, schedule_path: str, workdir: str) -> EvalResult:
         proc = subprocess.Popen(
-            [str(self.run_script), schedule_path, workdir],
+            [str(self.run_script), schedule_path, str(self.payload_path), workdir],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

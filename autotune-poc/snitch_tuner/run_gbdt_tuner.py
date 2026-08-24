@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
-"""Tune schedules/tile_l1_pipelined_tunable.mlir's tile_m/tile_n/tile_k
-transform.tune.knob values (the Snitch Milestone 6 pipeline: dual-buffered
-pipelining + all 8 compute cores) with the GBDT+GA search from
-../tuner_framework, the same search strategy ../mlir_tuner/run_gbdt_tuner.py
-uses for the CPU matmul PoC -- only the backend differs (see backend.py's
-module docstring for exactly what and why).
+"""Tune tile_m/tile_n/tile_k transform.tune.knob values for the Snitch
+matmul pipeline with the GBDT+GA search from ../tuner_framework, the same
+search strategy ../mlir_tuner/run_gbdt_tuner.py uses for the CPU matmul PoC
+-- only the backend differs (see backend.py's module docstring for exactly
+what and why).
+
+Two modes, via --mode:
+  pipelined (default) -- Uses double buffering which restrict the search space to tile sizes 
+  that evenly divide M/N/K
+  padded -- Uses transform.structured.pad to handle any remainder
 
 Usage:
     python3 snitch_tuner/run_gbdt_tuner.py \\
         --iterations 4 --init-samples 4 --ga-candidates-per-iter 3
-
-Every REAL candidate evaluated here is a full xDSL+LLVM compile followed by
-a gvsoc simulation run -- much more expensive than the CPU PoC's native
-compile+microbenchmark -- so the defaults below are deliberately much
-smaller than mlir_tuner/run_gbdt_tuner.py's (iterations=15, init_samples=16).
-Scale up once one round is confirmed to work end-to-end (see the plan's
-Verification section). ga-population/ga-generations are cheap (pure
-surrogate-model prediction, no real evaluation) and can stay larger without
-affecting wall-clock cost.
-
-M/N/K are auto-detected from --payload's own linalg.matmul op (see
-mlir_schedule.detect_matmul_dims), not passed on the CLI. The schedule
-file's own `options = [...]` is NEVER consulted for validity -- see
-mlir_tuner.backend.KnobSearchSpace's docstring; validity here comes
-entirely from backend.snitch_tile_constraint.
 """
 
 from __future__ import annotations
@@ -39,34 +28,44 @@ sys.path.insert(0, str(_POC_DIR))
 import pandas as pd  # noqa: E402
 
 from mlir_schedule import detect_matmul_dims, extract_knobs, render_schedule  # noqa: E402
-from mlir_tuner.backend import KnobSearchSpace  # noqa: E402
+from mlir_tuner.backend import KnobSearchSpace, detect_dtype_bytes  # noqa: E402
 from snitch_tuner.backend import (  # noqa: E402
-    SnitchGemmKnobFeatureExtractor, SnitchScheduleEvaluator,
-    snitch_divisor_sample_value, snitch_search_space_size, snitch_tile_constraint,
+    SnitchGemmKnobFeatureExtractor, SnitchScheduleEvaluator, max_l1_tile_dim,
+    snitch_divisor_sample_value, snitch_padded_tile_constraint,
+    snitch_padded_tile_sample_value, snitch_padded_search_space_size,
+    snitch_search_space_size, snitch_tile_constraint,
 )
 from tuner_framework import Tuner, TunerConfig  # noqa: E402
+
+# Per-mode defaults: (schedule path, run-script path). Both relative to _HERE.
+_MODE_DEFAULTS = {
+    "pipelined": ("schedules/tile_l1_pipelined_tunable.mlir", "driver/tune_candidate.sh"),
+    "padded": ("schedules/tile_l1_multicore_padded_tunable.mlir", "driver/tune_candidate_padded.sh"),
+}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument(
-        "schedule", nargs="?", type=Path,
-        default=_HERE / "schedules" / "tile_l1_pipelined_tunable.mlir",
-        help="Path to the .mlir transform schedule with unresolved "
-        "transform.tune.knob ops. (default: %(default)s)",
+        "--mode", choices=sorted(_MODE_DEFAULTS), default="padded",
+        help= "pipelined or padded"
     )
     p.add_argument(
-        "--payload", type=Path, default=_HERE / "payload" / "matmul_32.mlir",
+        "schedule", nargs="?", type=Path, default=None,
+        help="Path to the .mlir transform schedule with unresolved "
+        "transform.tune.knob ops. (default: depends on --mode)",
+    )
+    p.add_argument(
+        "--payload", type=Path, default=_HERE / "payload" / "matmul_128.mlir",
         help="Path to the matmul payload module -- M/N/K are detected from "
-        "here, not from the schedule file (Snitch keeps them in separate "
-        "files; see CLAUDE.md's tile_l1.mlir note). (default: %(default)s)",
+        "here, not from the schedule file. (default: %(default)s)",
     )
     p.add_argument("--results", type=Path, default=_HERE / "results" / "gbdt_search.csv")
     p.add_argument("--best-schedule", type=Path, default=_HERE / "results" / "best_schedule_gbdt.mlir")
     p.add_argument(
-        "--run-script", type=Path, default=_HERE / "driver" / "tune_candidate.sh",
-        help="Script that compiles one fully-resolved schedule through the "
-        "full Snitch M6 pipeline and runs it on gvsoc. (default: %(default)s)",
+        "--run-script", type=Path, default=None,
+        help="Script that compiles one fully-resolved schedule and runs it "
+        "on gvsoc. (default: depends on --mode)",
     )
     p.add_argument(
         "--timeout-s", type=float, default=300.0,
@@ -76,10 +75,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--iterations", type=int, default=10, help="outer iterations (default: %(default)s)")
-    p.add_argument("--init-samples", type=int, default=64, help="random samples in iteration 1 (default: %(default)s)")
+    p.add_argument("--init-samples", type=int, default=12, help="random samples in iteration 1 (default: %(default)s)")
     p.add_argument("--ga-population", type=int, default=100, help="GA population size (default: %(default)s)")
     p.add_argument("--ga-generations", type=int, default=100, help="GA generations (default: %(default)s)")
-    p.add_argument("--ga-candidates-per-iter", type=int, default=64,
+    p.add_argument("--ga-candidates-per-iter", type=int, default=12,
                     help="how many of the GA's top candidates get really evaluated per iteration "
                     "(default: %(default)s)")
     p.add_argument("--seed", type=int, default=None)
@@ -95,7 +94,14 @@ def parse_args() -> argparse.Namespace:
         "hand. Off by default since each one holds a full compiled ELF plus "
         "gvsoc logs.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+
+    default_schedule, default_run_script = _MODE_DEFAULTS[args.mode]
+    if args.schedule is None:
+        args.schedule = _HERE / default_schedule
+    if args.run_script is None:
+        args.run_script = _HERE / default_run_script
+    return args
 
 
 def main() -> None:
@@ -110,9 +116,10 @@ def main() -> None:
     if not tunable:
         sys.exit(f"No unresolved transform.tune.knob ops found in {args.schedule}. Nothing to tune.")
 
+    print(f"Mode: {args.mode}")
     print(f"Found {len(tunable)} tunable knob(s) in {args.schedule} (their "
           "file-declared options below are informational only -- NOT used "
-          "to constrain the search; only snitch_divisor_sample_value is):")
+          "to constrain the search; only the sample_value function is):")
     for k in tunable:
         print(f"  {k.name}: options = {k.options}")
     if fixed:
@@ -120,39 +127,36 @@ def main() -> None:
               f"{', '.join(k.name for k in fixed)})")
 
     dims = detect_matmul_dims(payload_text)
+    elem_bytes = detect_dtype_bytes(payload_text, default="f64")
+    max_tile = max_l1_tile_dim(elem_bytes)
     print(f"Detected GEMM dimensions from {args.payload}'s own linalg.matmul op: "
-          f"M={dims['M']}, N={dims['N']}, K={dims['K']}. tile_m is restricted to "
-          "multiples of 8 (required for M6's barrier-participant symmetry across "
-          "all 8 compute cores); tile_k excludes 1 and 2 (too many tile "
-          f"iterations); tile_n is fixed at N//2={dims['N'] // 2} (LowerPipelineOp's "
-          "on-ramp/steady-state/off-ramp expansion only generalizes correctly to a "
-          "pipeline trip count of exactly 2 -- found empirically, see "
-          "backend.snitch_tile_constraint's docstring for the two isolation tests "
-          "that pinned this down). tile_m and tile_k remain free.")
+          f"M={dims['M']}, N={dims['N']}, K={dims['K']}, element size {elem_bytes} bytes.")
 
-    sample_value = lambda name, rng: snitch_divisor_sample_value(name, rng, dims)  # noqa: E731
-    constraint = snitch_tile_constraint(dims)
+    if args.mode == "pipelined":
+        print("tile_m/tile_n/tile_k must each evenly divide M/N/K (dual-buffered "
+              "pipelining hard-crashes on padded/remainder tiles today"
+              "tile_m is additionally"
+              "restricted to multiples of 8")
+        sample_value = lambda name, rng: snitch_divisor_sample_value(name, rng, dims, elem_bytes)  # noqa: E731
+        constraint = snitch_tile_constraint(dims)
+        max_candidates = snitch_search_space_size(dims, elem_bytes)
+    else:
+        print("tile_m/tile_n/tile_k do NOT need to divide M/N/K evenly -- "
+              "transform.structured.pad handles any remainder "
+              ". tile_m is still "
+              "restricted to multiples of 8 (barrier-participant safety -- NOT "
+              "relaxed by padding).")
+        sample_value = lambda name, rng: snitch_padded_tile_sample_value(name, rng, dims, elem_bytes)  # noqa: E731
+        constraint = snitch_padded_tile_constraint(dims)
+        max_candidates = snitch_padded_search_space_size(dims, elem_bytes)
 
     search_space = KnobSearchSpace(tunable, sample_value, constraint=constraint)
     features = SnitchGemmKnobFeatureExtractor(payload_text)
     evaluator = SnitchScheduleEvaluator(
-        schedule_text, args.run_script, timeout_s=args.timeout_s,
+        schedule_text, args.run_script, args.payload, timeout_s=args.timeout_s,
         verbose=args.verbose, cleanup=not args.keep_workdirs,
     )
 
-    # The search space here is deliberately tiny (tile_n is pinned to a
-    # singleton -- see snitch_tile_constraint's docstring), so it's easy to
-    # request more samples/population than distinct valid candidates exist.
-    # That's not just wasteful, it HANGS: tuner_framework.Tuner's
-    # _propose_via_ga() fills its GA population with
-    # `while len(pop) < ga_population: ... sample_random() ...`, which
-    # never terminates once every valid candidate is already in the
-    # population and ga_population was requested higher than that -- see
-    # snitch_search_space_size's docstring. Clamp here rather than in
-    # tuner_framework/tuner.py itself, since that file is shared with the
-    # CPU backend and this ceiling is a Snitch-specific fact, not a general
-    # one.
-    max_candidates = snitch_search_space_size(dims)
     print(f"Total distinct valid (tile_m, tile_n, tile_k) combinations for "
           f"this payload: {max_candidates}.")
 

@@ -4,6 +4,7 @@
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -353,6 +354,75 @@ struct StatOpLowering : ConvertOpToLLVMPattern<snitch_dma::StatOp> {
   }
 };
 
+// Returns a converted block with the expected types, or a failure if the
+// conversion could not be applied. The block is converted in place, so the
+// caller must ensure that the block is not an entry block and that the
+// expected types are compatible with the block's current signature.
+static FailureOr<Block *> getConvertedBlock(ConversionPatternRewriter &rewriter,
+                                            const TypeConverter *converter,
+                                            Operation *branchOp, Block *block,
+                                            TypeRange expectedTypes) {
+  assert(converter && "expected non-null type converter");
+  assert(!block->isEntryBlock() && "entry blocks have no predecessors");
+
+  // There is nothing to do if the types already match.
+  if (block->getArgumentTypes() == expectedTypes)
+    return block;
+
+  std::optional<TypeConverter::SignatureConversion> conversion =
+      converter->convertBlockSignature(block);
+  if (!conversion)
+    return rewriter.notifyMatchFailure(branchOp,
+                                       "could not compute block signature");
+  if (expectedTypes != conversion->getConvertedTypes())
+    return rewriter.notifyMatchFailure(
+        branchOp,
+        "mismatch between adaptor operand types and computed block signature");
+  return rewriter.applySignatureConversion(block, *conversion, converter);
+}
+
+// The following two patterns are used to eliminate `dma.token` where it appears in control flow.
+struct TokenBranchOpLowering : OpConversionPattern<cf::BranchOp> {
+  using OpConversionPattern<cf::BranchOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cf::BranchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    FailureOr<Block *> convertedBlock =
+        getConvertedBlock(rewriter, getTypeConverter(), op, op.getDest(),
+                          TypeRange(adaptor.getDestOperands()));
+    if (failed(convertedBlock))
+      return failure();
+    rewriter.replaceOpWithNewOp<cf::BranchOp>(op, *convertedBlock,
+                                              adaptor.getDestOperands());
+    return success();
+  }
+};
+
+struct TokenCondBranchOpLowering : OpConversionPattern<cf::CondBranchOp> {
+  using OpConversionPattern<cf::CondBranchOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cf::CondBranchOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    FailureOr<Block *> convertedTrueBlock =
+        getConvertedBlock(rewriter, getTypeConverter(), op, op.getTrueDest(),
+                          TypeRange(adaptor.getTrueDestOperands()));
+    if (failed(convertedTrueBlock))
+      return failure();
+    FailureOr<Block *> convertedFalseBlock =
+        getConvertedBlock(rewriter, getTypeConverter(), op, op.getFalseDest(),
+                          TypeRange(adaptor.getFalseDestOperands()));
+    if (failed(convertedFalseBlock))
+      return failure();
+    rewriter.replaceOpWithNewOp<cf::CondBranchOp>(
+        op, adaptor.getCondition(), *convertedTrueBlock,
+        adaptor.getTrueDestOperands(), *convertedFalseBlock,
+        adaptor.getFalseDestOperands(), op.getBranchWeightsAttr());
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::populateDMAToLLVMConversionPatterns(
@@ -406,8 +476,24 @@ void ConvertDMAToLLVMPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   populateDMAToLLVMConversionPatterns(module, typeConverter, patterns);
 
+  // Also eliminate 'dma.token' where it appears as a block argument/branch
+  // operand (loop-carried through a pipelined 'scf.for'
+  TypeConverter tokenOnlyConverter;
+  tokenOnlyConverter.addConversion([](Type type) { return type; });
+  tokenOnlyConverter.addConversion([](dma::TokenType token) {
+    return IntegerType::get(token.getContext(), 32);
+  });
+  patterns.add<TokenBranchOpLowering, TokenCondBranchOpLowering>(
+      tokenOnlyConverter, &getContext());
+
   LLVMConversionTarget target(getContext());
   target.addIllegalDialect<dma::DMADialect, snitch_dma::SnitchDMADialect>();
+  target.addDynamicallyLegalOp<cf::BranchOp, cf::CondBranchOp>(
+      [](Operation *op) {
+        return llvm::none_of(op->getOperandTypes(), [](Type type) {
+          return isa<dma::TokenType>(type);
+        });
+      });
   if (failed(applyPartialConversion(module, target, std::move(patterns))))
     signalPassFailure();
 }

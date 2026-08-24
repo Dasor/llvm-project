@@ -90,6 +90,11 @@ ensure_python_env() {
   else
     info "venv already has xdsl-opt at $VENV (use --force to reinstall)"
   fi
+  if ! "$VENV/bin/python" -c 'import pandas, numpy, xgboost' 2>/dev/null; then
+    # Needed by autotune-poc/snitch_tuner's run_gbdt_tuner.py, not by xdsl/gvsoc themselves.
+    info "Installing pandas/numpy/xgboost (needed by autotune-poc/snitch_tuner)"
+    uv pip install --python "$VENV/bin/python" pandas numpy xgboost
+  fi
 }
 
 # ---------------------------------------------------------------------------

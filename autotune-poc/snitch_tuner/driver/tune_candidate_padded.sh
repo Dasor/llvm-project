@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Similar to snitch-backend/run_matmul32_multicore_pipelined_gvsoc.sh
-# e2e compilation of a candidate schedule, run in gvsoc, check correctness.
-# usage: tune_candidate.sh <resolved-schedule.mlir> <payload.mlir> <workdir>
+# usage: tune_candidate_padded.sh <resolved-schedule.mlir> <payload.mlir> <workdir>
 
 if [[ $# -ne 3 ]]; then
   echo "usage: $0 <resolved-schedule.mlir> <payload.mlir> <workdir>" >&2
@@ -19,7 +17,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"   # llvm-project/ root
                                                     # (driver/ -> snitch_tuner/ -> autotune-poc/ -> here)
 POC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"            # autotune-poc/snitch_tuner/
 
-# M/N/K come from the payload's own linalg.matmul op
+# M/N/K come from the payload's own linalg.matmul op, not a hardcoded
+# constant -- reuses mlir_schedule.detect_matmul_dims (the exact same
+# regex the Python side already uses) so there's only one place that
+# parses this, not a second shell implementation that could drift.
 read -r DIM_M DIM_N DIM_K <<< "$(python3 -c "
 import sys
 sys.path.insert(0, '$POC_DIR/..')
@@ -35,6 +36,9 @@ MLIR_OPT="$LLVM_BUILD/bin/mlir-opt"
 MLIR_TRANSLATE="$LLVM_BUILD/bin/mlir-translate"
 LLC="$LLVM_BUILD/bin/llc"
 
+# Genuinely external (not part of any LLVM checkout) -- overridable, defaults
+# match this machine's current setup, same pattern compile_schedule.sh uses
+# for CC/LIBOMP.
 # Self-contained: everything below lives inside llvm-project/snitch-backend/
 # (see its env.sh and runtime/snruntime/PROVENANCE.md), not in a sibling
 # Quidditch checkout. SB_ROOT can still be overridden if a different
@@ -48,30 +52,25 @@ SNRT="${SNRT:-$SB_ROOT/runtime/snruntime}"
 SNRUNTIME_API="${SNRUNTIME_API:-$SNRT/include}"
 RISCV_OPCODES_API="${RISCV_OPCODES_API:-$SB_ROOT/runtime/riscv-opcodes}"
 
-PREFIX="$WORKDIR/m6"
+PREFIX="$WORKDIR/m5p"
 
-echo "[+] Step 1a: tile via the transform dialect (resolved knobs)"
+echo "[+] Step 1a: tile + pad via the transform dialect (resolved knobs)"
 "$MLIR_OPT" \
   --transform-preload-library="transform-library-paths=$SCHEDULE" \
   --transform-interpreter --cse --canonicalize \
   "$PAYLOAD" \
   -o "${PREFIX}_step1a.mlir"
 
-echo "[+] Step 1b: promote operands to L1, CSE, canonicalize"
+echo "[+] Step 1b: promote pads + operands to L1, CSE, canonicalize"
 "$MLIR_OPT" \
-  --pass-pipeline='builtin.module(func.func(snitch-promote-operands-to-l1,cse,canonicalize))' \
+  --pass-pipeline='builtin.module(func.func(snitch-promote-pads-to-l1,cse,canonicalize,snitch-promote-operands-to-l1,cse,canonicalize))' \
   "${PREFIX}_step1a.mlir" -o "${PREFIX}_step1b.mlir"
 
-echo "[+] Step 1c: create snitch pipeline"
-"$MLIR_OPT" \
-  --pass-pipeline='builtin.module(func.func(snitch-pipeline-copy-compute))' \
-  "${PREFIX}_step1b.mlir" -o "${PREFIX}_step1c.mlir"
-
-echo "[+] Step 1d: tile the compute stage into per-hart scf.forall (thread-tiling)"
+echo "[+] Step 1d: tile the compute into per-hart scf.forall (thread-tiling)"
 "$MLIR_OPT" \
   --transform-preload-library="transform-library-paths=$POC_DIR/schedules/tile_l1_multicore.mlir" \
   --transform-interpreter --cse --canonicalize \
-  "${PREFIX}_step1c.mlir" -o "${PREFIX}_step1d.mlir"
+  "${PREFIX}_step1b.mlir" -o "${PREFIX}_step1d.mlir"
 
 echo "[+] Step 1e: eliminate empty tensors, form microkernels"
 "$MLIR_OPT" \
@@ -82,13 +81,9 @@ echo "[+] Step 2a: bufferize (function boundaries + real DMA memcpy)"
 "$MLIR_OPT" --snitch-bufferize='use-dma-memcpy=true' --cse --canonicalize \
   "${PREFIX}_step1.mlir" -o "${PREFIX}_step2.mlir"
 
-echo "[+] Step 2b: expand the pipeline compute-stage occurrences into scf.forall"
-"$MLIR_OPT" --snitch-lower-pipeline-op --cse --canonicalize \
-  "${PREFIX}_step2.mlir" -o "${PREFIX}_step2b.mlir"
-
 echo "[+] Step 2c: lower scf.forall to strided scf.for (one per hart)"
 "$MLIR_OPT" --snitch-lower-forall-op='compute-cores=8' --cse --canonicalize \
-  "${PREFIX}_step2b.mlir" -o "${PREFIX}_step2c.mlir"
+  "${PREFIX}_step2.mlir" -o "${PREFIX}_step2c.mlir"
 
 echo "[+] Step 3: lower L1 allocations, specialize DM/compute-core, legalize DMA ops"
 "$MLIR_OPT" \

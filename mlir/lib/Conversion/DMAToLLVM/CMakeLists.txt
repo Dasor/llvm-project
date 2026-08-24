@@ -11,6 +11,7 @@ add_mlir_conversion_library(MLIRDMAToLLVM
   MLIRDMADialect
   MLIRSnitchDMADialect
   MLIRAnalysis
+  MLIRControlFlowDialect
   MLIRIR
   MLIRLLVMCommonConversion
   MLIRLLVMDialect

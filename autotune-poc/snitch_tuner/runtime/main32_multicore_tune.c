@@ -2,9 +2,17 @@
 #include <sync_decls.h>
 #include <team_decls.h>
 
+// M/K/N are injected at compile time via -DM=... -DK=... -DN=... (see
+// driver/tune_candidate.sh and tune_candidate_padded.sh's Step 9)
+#ifndef M
 #define M 32
+#endif
+#ifndef K
 #define K 32
+#endif
+#ifndef N
 #define N 32
+#endif
 
 // matmul for normal cores
 extern double *matmul(double *lhs, double *rhs, double *out);
