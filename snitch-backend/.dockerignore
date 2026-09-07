@@ -1,4 +1,5 @@
 gvsoc/
 xdsl/
+snitch_cluster/
 out/
 build/

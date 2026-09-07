@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds/verifies the three moving pieces the matmul driver needs:
-# LLVM (mlir-opt/mlir-translate/llc), the xdsl-opt venv, and gvsoc.
+# Builds/verifies the moving pieces the matmul driver needs:
+# LLVM (mlir-opt/mlir-translate/llc), the xdsl-opt venv, gvsoc, and the
+# Verilator-built snitch_cluster RTL model (+ a matching snRuntime rebuild).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,24 +13,26 @@ info() { echo "[+] $*"; }
 DO_LLVM=0
 DO_XDSL=0
 DO_GVSOC=0
+DO_VERILATOR=0
 REBUILD_LLVM=0
 RECONFIGURE_LLVM=0
 FORCE=0
 
 if [ "$#" -eq 0 ]; then
-  DO_LLVM=1; DO_XDSL=1; DO_GVSOC=1
+  DO_LLVM=1; DO_XDSL=1; DO_GVSOC=1; DO_VERILATOR=1
 fi
 
 for arg in "$@"; do
   case "$arg" in
-    --all) DO_LLVM=1; DO_XDSL=1; DO_GVSOC=1 ;;
+    --all) DO_LLVM=1; DO_XDSL=1; DO_GVSOC=1; DO_VERILATOR=1 ;;
     --llvm) DO_LLVM=1 ;;
     --xdsl) DO_XDSL=1 ;;
     --gvsoc) DO_GVSOC=1 ;;
+    --verilator) DO_VERILATOR=1 ;;
     --rebuild-llvm) DO_LLVM=1; REBUILD_LLVM=1 ;;
     --reconfigure-llvm) DO_LLVM=1; RECONFIGURE_LLVM=1 ;;
     --force) FORCE=1 ;;
-    *) die "unknown flag: $arg (expected --llvm|--xdsl|--gvsoc|--all|--rebuild-llvm|--reconfigure-llvm|--force)" ;;
+    *) die "unknown flag: $arg (expected --llvm|--xdsl|--gvsoc|--verilator|--all|--rebuild-llvm|--reconfigure-llvm|--force)" ;;
   esac
 done
 
@@ -130,6 +133,49 @@ if [ "$DO_GVSOC" -eq 1 ]; then
   gvrun --target snitch --work-dir "$OUT/.gvsoc_smoke_test" commands >/dev/null || \
     die "gvrun --target snitch commands failed -- gvsoc build is incomplete or broken"
   info "gvrun smoke test passed (snitch target resolved)."
+fi
+
+ensure_snitch_cluster_submodule() {
+  if [ ! -f "$SNITCH_CLUSTER_ROOT/Makefile" ]; then
+    info "Initializing snitch_cluster submodule"
+    git -C "$LLVM_ROOT" submodule update --init "snitch-backend/snitch_cluster"
+  fi
+  if [ ! -d "$SNITCH_CLUSTER_ROOT/sw/deps/printf/src" ] || [ ! -d "$SNITCH_CLUSTER_ROOT/sw/deps/riscv-opcodes/.git" ] || \
+     [ ! -f "$SNITCH_CLUSTER_ROOT/sw/deps/riscv-tests/isa/rv32ud/Makefrag" ]; then
+    # printf/riscv-opcodes are needed by sw/runtime; riscv-tests is needed just to
+    # *parse* the Makefile (sw/riscv-tests/riscv-tests.mk unconditionally `include`s
+    # Makefrag files from it) even though we never build its test binaries here.
+    info "Initializing snitch_cluster's printf/riscv-opcodes/riscv-tests submodules"
+    git -C "$SNITCH_CLUSTER_ROOT" submodule update --init sw/deps/printf sw/deps/riscv-opcodes sw/deps/riscv-tests
+  fi
+}
+
+
+SNITCH_CLUSTER_TOOLCHAIN_VARS=(
+  "SN_LLVM_BINROOT=$TOOLCHAIN/bin"
+)
+
+# ---------------------------------------------------------------------------
+# Step 4: Verilator-built snitch_cluster RTL model
+# ---------------------------------------------------------------------------
+if [ "$DO_VERILATOR" -eq 1 ]; then
+  if [ "$FORCE" -eq 1 ]; then
+    rm -f "$SNITCH_CLUSTER_VLT"
+  fi
+  if [ ! -x "$SNITCH_CLUSTER_VLT" ]; then
+    ensure_snitch_cluster_submodule
+    if [ ! -x "$SNITCH_CLUSTER_VENV/bin/peakrdl" ]; then
+      info "Syncing snitch_cluster's own Python env (peakrdl/clustergen) at $SNITCH_CLUSTER_VENV"
+      (cd "$SNITCH_CLUSTER_ROOT" && UV_PROJECT_ENVIRONMENT="$SNITCH_CLUSTER_VENV" uv sync --extra all --locked)
+    fi
+    info "Verilating snitch_cluster (cfg/default.json, TRACE_DMA_ONLY=1) -- this can take a while"
+    PATH="$SNITCH_CLUSTER_VENV/bin:$PATH" TRACE_DMA_ONLY=1 \
+      make -C "$SNITCH_CLUSTER_ROOT" -j"$(nproc)" verilator "${SNITCH_CLUSTER_TOOLCHAIN_VARS[@]}"
+  else
+    info "Verilator model already built at $SNITCH_CLUSTER_VLT (use --force to rebuild)"
+  fi
+  [ -x "$SNITCH_CLUSTER_VLT" ] || die "$SNITCH_CLUSTER_VLT not found/executable after 'make verilator'"
+  info "Verilator model present at $SNITCH_CLUSTER_VLT."
 fi
 
 info "build.sh done."

@@ -4,3 +4,6 @@
 [submodule "snitch-backend/xdsl"]
 	path = snitch-backend/xdsl
 	url = https://github.com/xdslproject/xdsl
+[submodule "snitch-backend/snitch_cluster"]
+	path = snitch-backend/snitch_cluster
+	url = https://github.com/CAPS-UMU/snitch_cluster.git

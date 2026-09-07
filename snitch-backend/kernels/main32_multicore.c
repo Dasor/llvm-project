@@ -2,9 +2,15 @@
 #include <sync_decls.h>
 #include <team_decls.h>
 
+#ifndef M
 #define M 32
+#endif
+#ifndef K
 #define K 32
+#endif
+#ifndef N
 #define N 32
+#endif
 
 // matmul for normal cores
 extern double *matmul(double *lhs, double *rhs, double *out);
