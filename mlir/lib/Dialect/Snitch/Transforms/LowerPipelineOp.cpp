@@ -209,13 +209,17 @@ void LowerPipelineOp::runOnOperation() {
       oldResultsOfStages[i] = forOp.getResults().slice(begin, end - begin);
     }
 
-    // Compute the real inclusive UB of the IV as it'd be at the end of the
-    // 'scf.for'.
+    // Compute the IV as it'd be at the end of the 'scf.for', i.e. one step past
+    // the last iteration: lb + ceildiv(ub - lb, step) * step. Rounding up
+    // matters when the trip range is not a multiple of the step (e.g. padded
+    // remainder tiles), otherwise the off-ramp would reuse an earlier IV.
+    AffineExpr lb = builder.getAffineDimExpr(0);
+    AffineExpr ub = builder.getAffineDimExpr(1);
+    AffineExpr step = builder.getAffineDimExpr(2);
     currentIV = affine::makeComposedAffineApply(
-        builder, pipelineOp->getLoc(),
-        builder.getAffineDimExpr(0).floorDiv(builder.getAffineDimExpr(1)) *
-            builder.getAffineDimExpr(1),
-        {forOp.getUpperBound(), forOp.getStep()});
+        builder, pipelineOp->getLoc(), lb + (ub - lb).ceilDiv(step) * step,
+        {pipelineOp.getLowerBound(), pipelineOp.getUpperBound(),
+         pipelineOp.getStep()});
 
     // Paste the stages until the last stage has done its last iteration.
     for (unsigned i = 1; i < pipelineOp.getRegions().size(); i++) {

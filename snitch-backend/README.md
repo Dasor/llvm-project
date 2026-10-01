@@ -23,11 +23,39 @@ point at an equivalent toolchain checkout yourself.
 ```shell
 docker compose build
 docker compose run --rm snitch ./build.sh --all
-docker compose run --rm snitch ./run_matmul32_multicore_pipelined_gvsoc.sh
-docker compose run --rm snitch ./run_matmul32_multicore_pipelined.sh
+docker compose run --rm snitch ./run_gemm.py 32 32 32 16 16 16 true gvsoc xdsl true
+docker compose run --rm snitch ./run_gemm.py 32 32 32 16 16 16 true verilator xdsl true
 ```
 
 Expect `all 1024 values matched` at the end of each run.
+
+## run_gemm.py
+
+A single driver compiles and runs every GEMM configuration:
+
+```shell
+./run_gemm.py <N> <M> <K> <n> <m> <k> <pipelined> <simulator> <microkernel> <verify>
+```
+
+| Argument | Values | Meaning |
+|---|---|---|
+| `N M K` | positive ints | C (MxN) = A (MxK) @ B (KxN) |
+| `n m k` | positive ints | L1 tile size along N, M, K |
+| `pipelined` | `true`, `false` | dual-buffered DMA/compute pipelining |
+| `simulator` | `gvsoc`, `verilator` | fast ISS or cycle-accurate RTL model |
+| `microkernel` | `xdsl`, `library` | xDSL-generated asm, or snitch_cluster's `gemm_fp64.h` via `kernels/gemm_library_kernel.cpp` |
+| `verify` | `true`, `false` | check C against a reference: on gvsoc by the DM core (`gemm_main.c -DVERIFY`); on Verilator on the host by `verify_gemm_ipc.py`, which reads C out of simulated memory over the testbench IPC interface (no extra simulated cycles) |
+
+Constraints (checked up front):
+- `m` must be a multiple of the 8 compute cores.
+- Dimensions need not be divisible by their tiles: remainder tiles are zero-padded up to the full tile size by the DMA copy into L1, in both modes.
+- At least one of M, N, K must be split into more than one tile (at least two when pipelined), due to current bufferization limitations.
+- `library` needs `n % 8 == 0`.
+- `library` also needs `snitch_cluster/sw/runtime/impl/snitch_cluster_cfg.h`, which `./build.sh --verilator` generates.
+- A tile that doesn't fit in L1 fails in `snitch-lower-l1-allocations`.
+
+All intermediates for a configuration go to
+`$OUT/gemm_M<M>_N<N>_K<K>_t<m>x<n>x<k>_<pipe|nopipe>_<microkernel>/`.
 
 For the (potentially long) `--reconfigure-llvm`, first-time gvsoc build, or
 the Verilator RTL build below, prefer a persistent container over `run --rm`
@@ -44,7 +72,7 @@ For this case we use the gvsoc simulator which is much faster but not cycle accu
 
 ## Verilator (cycle-accurate)
 
-`run_matmul32_multicore_pipelined.sh` (no `_gvsoc` suffix) runs the same
+`run_gemm.py ... verilator ...` runs the same
 build on a real, cycle-accurate Verilator RTL model instead of gvsoc, via the
 `snitch-backend/snitch_cluster` submodule (a
 [fork](https://github.com/CAPS-UMU/snitch_cluster) of

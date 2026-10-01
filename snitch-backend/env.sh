@@ -11,6 +11,10 @@ VENV="$SB_ROOT/build/.venv"
 GVSOC_ROOT="$SB_ROOT/gvsoc"
 GVSOC_WORKDIR="$SB_ROOT/build/gvsoc"
 TOOLCHAIN="${QUIDDITCH_TOOLCHAIN:-$SB_ROOT/toolchain}"
+# snitch_cluster's own LLVM fork (-mcpu=snitch, real SSR/FREP instruction
+# support) -- used only for compiling C-library-based microkernels (see
+# kernels/gemm_library_kernel.cpp), not for anything TOOLCHAIN above does.
+SNITCH_TOOLCHAIN="${SNITCH_TOOLCHAIN:-$SB_ROOT/snitch-toolchain}"
 SNRT="$SB_ROOT/runtime/snruntime"
 RISCV_OPCODES="$SB_ROOT/runtime/riscv-opcodes"
 KERNELS="$SB_ROOT/kernels"
@@ -30,6 +34,6 @@ export UV_CACHE_DIR="$SB_ROOT/build/.uv-cache"
 
 export PATH="$VENV/bin:$GVSOC_WORKDIR/install/bin:$PATH"
 
-export SB_ROOT LLVM_ROOT LLVM_BUILD VENV GVSOC_ROOT GVSOC_WORKDIR TOOLCHAIN SNRT RISCV_OPCODES KERNELS OUT
+export SB_ROOT LLVM_ROOT LLVM_BUILD VENV GVSOC_ROOT GVSOC_WORKDIR TOOLCHAIN SNITCH_TOOLCHAIN SNRT RISCV_OPCODES KERNELS OUT
 export SNITCH_CLUSTER_ROOT SNITCH_CLUSTER_VENV SNITCH_CLUSTER_VLT
 export MLIR_OPT MLIR_TRANSLATE LLC XDSL_OPT

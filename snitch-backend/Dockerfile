@@ -2,6 +2,13 @@
 # We take advatnage of the RISC-V build already present in the Quidditch image so we dont have to build again
 FROM ghcr.io/opencompl/quidditch/toolchain:main AS toolchain
 
+# snitch_cluster's own LLVM fork (real -mcpu=snitch support, incl. the custom
+# SSR/FREP instructions like scfgwi/frep.o). The Quidditch toolchain above only
+# knows generic-rv32 and can't assemble those -- this is needed to compile
+# microkernels from the snitch_cluster C BLAS library (sw/kernels/blas/*)
+# directly, instead of going through xDSL.
+FROM ghcr.io/pulp-platform/snitch_cluster-sw:main AS snitch_toolchain
+
 # Same as the snitch-cluster image
 FROM hpretl/iic-osic-tools:2026.02 AS oseda
 
@@ -24,6 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copying from the Quidditch toolchain image to avoid rebuilding the RISC-V toolchain
 COPY --from=toolchain /opt/quidditch-toolchain /opt/quidditch-toolchain
 ENV QUIDDITCH_TOOLCHAIN=/opt/quidditch-toolchain
+
+# Copying from the snitch_cluster-sw image to avoid rebuilding its LLVM fork
+COPY --from=snitch_toolchain /tools/riscv-llvm /opt/snitch-toolchain
+ENV SNITCH_TOOLCHAIN=/opt/snitch-toolchain
 
 # Verilator, copied from the oseda image (see the FROM above) instead of installed
 # from a PPA -- this is exactly what snitch_cluster's own container build does.
