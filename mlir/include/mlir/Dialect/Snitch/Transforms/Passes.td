@@ -10,6 +10,30 @@ def FormMicrokernelsPass
   ];
 }
 
+def HoistReductionAccumulatorPass : Pass<"snitch-hoist-reduction-accumulator"> {
+  let description = [{
+    Keeps the accumulator of a tiled compute op live across the innermost
+    tiling loop instead of extracting (and padding) it from the full output
+    tensor and inserting it back on every iteration.
+
+    Runs upstream loop-invariant code motion and subset hoisting on the
+    `scf.for` directly surrounding each tensor-semantics linalg op, then
+    rewrites the hoisted accumulator so the loop carries the (padded) tensor
+    the op accumulates into: the `tensor.pad` moves before the loop, the
+    unpadding `tensor.extract_slice` after it, and a per-iteration
+    `bufferization.materialize_in_destination` copy-back is dropped.
+
+    Run before L1 promotion: the accumulator is then copied into L1 once per
+    loop instead of once per iteration, and the loop carries no data
+    dependence through its copies, allowing `snitch-pipeline-copy-compute` to
+    pipeline reduction loops.
+  }];
+
+  let dependentDialects = [
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
 def PromotePadsToL1Pass : Pass<"snitch-promote-pads-to-l1"> {
   let description = [{
     Converts supported `tensor.pad` operations to `start_tensor_transfer` and
@@ -111,9 +135,11 @@ def BufferizePass : Pass<"snitch-bufferize", "mlir::ModuleOp"> {
   ];
 
   let dependentDialects = [
+    "mlir::arith::ArithDialect",
     "mlir::bufferization::BufferizationDialect",
     "mlir::memref::MemRefDialect",
     "mlir::dma::DMADialect",
+    "mlir::scf::SCFDialect",
   ];
 }
 
@@ -163,9 +189,29 @@ def LowerPipelineOpPass : Pass<"snitch-lower-pipeline-op"> {
     of different stages can execute concurrently. Tensor-semantics
     `snitch.pipeline` ops (not yet bufferized) are left untouched. Operates
     at the memref level, after `snitch-lower-l1-allocations`.
+
+    With `prefetch-across-iterations`, a two-stage pipeline that is the body
+    of an enclosing `scf.for` (e.g. the K pipeline of an output tile in the
+    loop over output tiles) issues the copy stage of the next iteration of
+    that loop during its own last compute stage, instead of in the on-ramp of
+    the next iteration: the first transfers of the next iteration then
+    overlap with compute. The pipeline's buffers are hoisted out of the loop
+    into a `memref.alloca_scope`. Only applied when legal: the first and last
+    pipeline iterations use different buffers (an even trip count for two
+    stages), the copy stage only starts transfers and depends on nothing in
+    the loop but pure ops and the induction variable, and nothing else in the
+    loop writes memory it reads.
   }];
 
+  let options = [
+    Option<"prefetchAcrossIterations", "prefetch-across-iterations", "bool",
+           "true",
+           "Issue the copy stage of the next iteration of the enclosing loop "
+           "during the last compute stage.">,
+  ];
+
   let dependentDialects = [
+    "mlir::memref::MemRefDialect",
     "mlir::scf::SCFDialect",
   ];
 }

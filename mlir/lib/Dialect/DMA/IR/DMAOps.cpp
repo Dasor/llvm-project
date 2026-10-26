@@ -2,9 +2,12 @@
 
 #include "llvm/ADT/ScopeExit.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
 
@@ -318,12 +321,44 @@ StartTensorCopyOp::bufferize(RewriterBase &rewriter,
   // TODO: This could be optimized to only zero regions that won't be filled
   //  with the copied values at the cost of 2^rank transfers instead of two.
   if (hasPadding() && !getUndefPadding()) {
-    Value token = rewriter.create<StartZeroMemTransferOp>(getLoc(), *alloc);
-    // TODO: This wait is required as the zero mem transfer writes to the same
-    //       memory as the transfer below. This is currently unspecified
-    //       behaviour (both in the DMA dialect and in Snitch as far as we
-    //       know).
-    rewriter.create<WaitForTransferOp>(getLoc(), token);
+    auto zeroFill = [&](OpBuilder &builder, Location loc) {
+      Value token = builder.create<StartZeroMemTransferOp>(loc, *alloc);
+      // TODO: This wait is required as the zero mem transfer writes to the
+      //       same memory as the transfer below. This is currently unspecified
+      //       behaviour (both in the DMA dialect and in Snitch as far as we
+      //       know).
+      builder.create<WaitForTransferOp>(loc, token);
+    };
+
+    // Only zero-fill when there is padding at runtime: with dynamic padding
+    // (e.g. only the remainder tile of a tiled loop is padded), full tiles
+    // skip the extra transfer and the wait for it.
+    bool alwaysPadded = false;
+    SmallVector<Value> dynamicPads;
+    for (OpFoldResult pad : getMixedHighPad()) {
+      if (std::optional<int64_t> constant = getConstantIntValue(pad))
+        alwaysPadded |= *constant != 0;
+      else
+        dynamicPads.push_back(cast<Value>(pad));
+    }
+    if (alwaysPadded) {
+      zeroFill(rewriter, getLoc());
+    } else if (!dynamicPads.empty()) {
+      Value zero = rewriter.create<arith::ConstantIndexOp>(getLoc(), 0);
+      Value isPadded;
+      for (Value pad : dynamicPads) {
+        Value nonZero = rewriter.create<arith::CmpIOp>(
+            getLoc(), arith::CmpIPredicate::ne, pad, zero);
+        isPadded = isPadded ? rewriter.create<arith::OrIOp>(getLoc(), isPadded,
+                                                            nonZero)
+                            : nonZero;
+      }
+      rewriter.create<scf::IfOp>(getLoc(), isPadded,
+                                 [&](OpBuilder &builder, Location loc) {
+                                   zeroFill(builder, loc);
+                                   builder.create<scf::YieldOp>(loc);
+                                 });
+    }
   }
 
   // Subview into the original memory without any padding.

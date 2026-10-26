@@ -41,12 +41,22 @@ static void removeUnsupportedSpecializedOps(FunctionOpInterface function) {
   });
 }
 
-/// Inserts a barrier after every operation requiring according to
+/// Returns true if 'operation' requires a barrier after it according to
 /// 'CoreSpecializationOpInterface'.
+static bool needsSynchronization(Operation *operation) {
+  auto specialization = dyn_cast_or_null<CoreSpecializationOpInterface>(
+      operation);
+  return specialization && specialization.needsSynchronization();
+}
+
+/// Inserts a barrier after every operation requiring according to
+/// 'CoreSpecializationOpInterface'. Consecutive such operations (e.g. the waits
+/// for several transfers) share a single barrier after the last of them.
 /// Note: Does not currently support barriers in divergent control flow.
 static void insertBarriers(FunctionOpInterface function) {
   function->walk([](CoreSpecializationOpInterface operation) {
-    if (!operation.needsSynchronization())
+    if (!operation.needsSynchronization() ||
+        needsSynchronization(operation->getNextNode()))
       return;
 
     OpBuilder builder(operation.getContext());

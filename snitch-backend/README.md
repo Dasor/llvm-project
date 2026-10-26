@@ -49,10 +49,13 @@ A single driver compiles and runs every GEMM configuration:
 Constraints (checked up front):
 - `m` must be a multiple of the 8 compute cores.
 - Dimensions need not be divisible by their tiles: remainder tiles are zero-padded up to the full tile size by the DMA copy into L1, in both modes.
-- At least one of M, N, K must be split into more than one tile (at least two when pipelined), due to current bufferization limitations.
+- At least one of M, N, K must be split into more than one tile, due to a current bufferization limitation.
+- Pipelined mode dual-buffers the K loop, so it needs `k < K`.
 - `library` needs `n % 8 == 0`.
 - `library` also needs `snitch_cluster/sw/runtime/impl/snitch_cluster_cfg.h`, which `./build.sh --verilator` generates.
-- A tile that doesn't fit in L1 fails in `snitch-lower-l1-allocations`.
+- A tile that doesn't fit in L1 fails in `snitch-lower-l1-allocations`. The C tile stays in L1 across the K loop (`snitch-hoist-reduction-accumulator`), so L1 holds A + B + C non-pipelined and 2·(A + B) + C pipelined (f64, 8 bytes per element; budget 112,640 bytes).
+- Pipelined mode also issues the next output tile's first A and B copies during the current tile's last K step, when the K loop has an even number of steps (see `PERFORMANCE.md`, Change 6). `GEMM_PREFETCH=0` turns this off.
+- `snitch.barrier` is lowered to the cluster's hardware barrier, since every barrier involves all 9 harts (see `PERFORMANCE.md`, Change 7). `GEMM_HW_BARRIER=0` selects the runtime's software barrier instead.
 
 All intermediates for a configuration go to
 `$OUT/gemm_M<M>_N<N>_K<K>_t<m>x<n>x<k>_<pipe|nopipe>_<microkernel>/`.

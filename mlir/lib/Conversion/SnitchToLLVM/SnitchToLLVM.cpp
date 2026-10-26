@@ -56,18 +56,33 @@ struct BarrierOpLowering : ConvertOpToLLVMPattern<BarrierOp> {
   LLVM::GlobalOp barrierGlobal;
   LLVM::LLVMFuncOp partialBarrierFunc;
   unsigned numParticipants;
+  bool hwBarrier;
 
   BarrierOpLowering(LLVM::GlobalOp barrierGlobal,
                     LLVM::LLVMFuncOp partialBarrierFunc,
-                    unsigned numParticipants,
+                    unsigned numParticipants, bool hwBarrier,
                     const LLVMTypeConverter &converter)
       : ConvertOpToLLVMPattern(converter), barrierGlobal(barrierGlobal),
         partialBarrierFunc(partialBarrierFunc),
-        numParticipants(numParticipants) {}
+        numParticipants(numParticipants), hwBarrier(hwBarrier) {}
 
   LogicalResult
   matchAndRewrite(BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // With every hart of the cluster participating, the hardware barrier
+    // (snrt_cluster_hw_barrier) is equivalent, and takes a few cycles instead
+    // of atomics on and polling of _snrt_barrier, which is in L3.
+    if (hwBarrier) {
+      rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(
+          op, /*res=*/TypeRange(), /*operands=*/ValueRange(),
+          // csrr x0, barrier
+          "csrr x0, 0x7c2", /*constraints=*/"~{memory}",
+          /*has_side_effects=*/true, /*is_align_stack=*/false,
+          LLVM::tailcallkind::TailCallKind::None,
+          /*asm_dialect=*/nullptr, /*operand_attrs=*/nullptr);
+      return success();
+    }
+
     // Every snitch.barrier is a rendezvous between exactly the compute-core
     // and DM-core clones SpecializeDMACode produces - not a whole-cluster
     // barrier. Lower it to a 2-party software barrier (snrt_partial_barrier)
@@ -203,7 +218,8 @@ struct ComputeCoreIndexOpLowering : ConvertOpToLLVMPattern<ComputeCoreIndexOp> {
 
 void mlir::populateSnitchToLLVMConversionPatterns(
     mlir::ModuleOp moduleOp, LLVMTypeConverter &typeConverter,
-    RewritePatternSet &patterns, unsigned barrierParticipants) {
+    RewritePatternSet &patterns, unsigned barrierParticipants,
+    bool hwBarrier) {
 
   auto builder = OpBuilder::atBlockEnd(moduleOp.getBody());
   IntegerType i32 = builder.getI32Type();
@@ -234,7 +250,8 @@ void mlir::populateSnitchToLLVMConversionPatterns(
   patterns.insert<L1MemoryViewOpLowering, MicrokernelFenceOpLowering>(
       typeConverter);
   patterns.insert<BarrierOpLowering>(barrierGlobal, partialBarrierFunc,
-                                     barrierParticipants, typeConverter);
+                                     barrierParticipants, hwBarrier,
+                                     typeConverter);
   patterns.insert<ComputeCoreIndexOpLowering>(computeCoreIndex, typeConverter);
   patterns.insert<CallMicrokernelOpLowering>(SymbolTable(moduleOp),
                                              typeConverter);
@@ -257,7 +274,7 @@ void ConvertSnitchToLLVMPass::runOnOperation() {
   LLVMTypeConverter typeConverter(&getContext(), options);
   RewritePatternSet patterns(&getContext());
   populateSnitchToLLVMConversionPatterns(module, typeConverter, patterns,
-                                         barrierParticipants);
+                                         barrierParticipants, hwBarrier);
 
   LLVMConversionTarget target(getContext());
   target.addIllegalDialect<SnitchDialect>();

@@ -71,6 +71,78 @@ static bool isContiguous(MemRefType memRefType) {
 }
 
 namespace {
+/// Attribute marking the stack slot of a function holding the ID of the last
+/// DMA transfer it started (see 'getTransferId').
+constexpr llvm::StringLiteral lastTransferIdAttr = "dma.last_transfer_id";
+
+/// Returns the ID of the transfer started by the call 'start' to
+/// 'snrt_dma_start_1d/2d', which return the transfer ID 'dmcpy' returns.
+///
+/// That ID is not always the transfer's: Snitch's iDMA frontend answers
+/// 'dmcpy' with its next-ID counter as soon as it accepts the request into its
+/// request FIFO, but only increments the counter when a request leaves the
+/// FIFO. With the backend busy and a request already waiting in the FIFO, a
+/// new request is given the ID of the waiting one, and waiting for it returns
+/// as soon as the waiting one has completed. Transfers are issued and retired
+/// in order, so the actual ID is one more than that of the previous transfer:
+/// the function keeps the last ID in a stack slot and uses
+/// max(returned ID, last ID + 1).
+/// Note: Assumes the IDs do not wrap around (32 bit) and that the function is
+/// the only one issuing transfers while it runs.
+static Value getTransferId(ConversionPatternRewriter &rewriter, Operation *op,
+                           Value returnedId) {
+  Location loc = op->getLoc();
+  auto function = op->getParentOfType<FunctionOpInterface>();
+  Block &entry = function.getFunctionBody().front();
+  IntegerType i32 = rewriter.getI32Type();
+  auto ptrType = rewriter.getType<LLVM::LLVMPointerType>();
+
+  Value slot;
+  for (Operation &candidate : entry)
+    if (candidate.hasAttr(lastTransferIdAttr))
+      slot = candidate.getResult(0);
+  if (!slot) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&entry);
+    Value one = rewriter.create<LLVM::ConstantOp>(
+        loc, rewriter.getI32IntegerAttr(1));
+    auto alloca = rewriter.create<LLVM::AllocaOp>(loc, ptrType, i32, one);
+    alloca->setAttr(lastTransferIdAttr, rewriter.getUnitAttr());
+    // Transfer IDs start at 2; 0 is the completed token.
+    Value zero = rewriter.create<LLVM::ConstantOp>(
+        loc, rewriter.getI32IntegerAttr(0));
+    rewriter.create<LLVM::StoreOp>(loc, zero, alloca);
+    slot = alloca;
+  }
+
+  Value last = rewriter.create<LLVM::LoadOp>(loc, i32, slot);
+  Value next = rewriter.create<LLVM::AddOp>(
+      loc, last,
+      rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32IntegerAttr(1)));
+  Value id = rewriter.create<LLVM::UMaxOp>(loc, returnedId, next);
+  rewriter.create<LLVM::StoreOp>(loc, id, slot);
+  return id;
+}
+
+/// Replaces 'op' with a call to 'callee', a DMA start function, and the
+/// transfer ID derived from its result.
+static void replaceWithStartCall(ConversionPatternRewriter &rewriter,
+                                 Operation *op, LLVM::LLVMFuncOp callee,
+                                 ValueRange operands) {
+  auto call = rewriter.create<LLVM::CallOp>(op->getLoc(), callee, operands);
+  rewriter.replaceOp(op, getTransferId(rewriter, op, call.getResult()));
+}
+
+/// Like 'replaceWithStartCall' for a start call that is not the replacement
+/// of an op.
+static void createStartCall(ConversionPatternRewriter &rewriter, Operation *op,
+                            LLVM::LLVMFuncOp callee, ValueRange operands) {
+  auto call = rewriter.create<LLVM::CallOp>(op->getLoc(), callee, operands);
+  getTransferId(rewriter, op, call.getResult());
+}
+} // namespace
+
+namespace {
 struct StartTransferOpLowering : ConvertOpToLLVMPattern<StartTransferOp> {
 
   LLVM::LLVMFuncOp dmaStart1DFunc;
@@ -105,12 +177,12 @@ struct StartTransferOpLowering : ConvertOpToLLVMPattern<StartTransferOp> {
         op->getLoc(), sourceDescriptor.size(rewriter, op->getLoc(), rank - 1),
         elementSize);
     if (rank == 1) {
-      rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, dmaStart1DFunc,
-                                                ValueRange{
-                                                    dest,
-                                                    source,
-                                                    innerSize,
-                                                });
+      replaceWithStartCall(rewriter, op, dmaStart1DFunc,
+                           ValueRange{
+                               dest,
+                               source,
+                               innerSize,
+                           });
     } else {
       Value sourceStride = rewriter.create<LLVM::MulOp>(
           op->getLoc(), sourceDescriptor.stride(rewriter, op->getLoc(), 0),
@@ -118,8 +190,8 @@ struct StartTransferOpLowering : ConvertOpToLLVMPattern<StartTransferOp> {
       Value destStride = rewriter.create<LLVM::MulOp>(
           op->getLoc(), destDescriptor.stride(rewriter, op->getLoc(), 0),
           elementSize);
-      rewriter.replaceOpWithNewOp<LLVM::CallOp>(
-          op, dmaStart2DFunc,
+      replaceWithStartCall(
+          rewriter, op, dmaStart2DFunc,
           ValueRange{
               dest,
               source,
@@ -193,10 +265,9 @@ struct StartContiguousZeroMemTransferOpOpLowering
     // Note: This call would not be legal as a 'start_dma_transfer' call as
     // MemRefs do not allow internal aliasing, which the below does via the
     // stride of 0.
-    rewriter.create<LLVM::CallOp>(op->getLoc(), dmaStart2DFunc,
-                                  ValueRange{bufferPointer, zeroPointer,
-                                             zeroMemSizeValue, zeroMemSizeValue,
-                                             zero, times2D});
+    createStartCall(rewriter, op, dmaStart2DFunc,
+                    ValueRange{bufferPointer, zeroPointer, zeroMemSizeValue,
+                               zeroMemSizeValue, zero, times2D});
     Value offset =
         rewriter.create<LLVM::MulOp>(op->getLoc(), times2D, zeroMemSizeValue);
     bufferPointer = rewriter.create<LLVM::GEPOp>(
@@ -204,8 +275,8 @@ struct StartContiguousZeroMemTransferOpOpLowering
         bufferPointer, offset);
     Value rest =
         rewriter.create<LLVM::URemOp>(op->getLoc(), size, zeroMemSizeValue);
-    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
-        op, dmaStart1DFunc, ValueRange{bufferPointer, zeroPointer, rest});
+    replaceWithStartCall(rewriter, op, dmaStart1DFunc,
+                         ValueRange{bufferPointer, zeroPointer, rest});
     return success();
   }
 };

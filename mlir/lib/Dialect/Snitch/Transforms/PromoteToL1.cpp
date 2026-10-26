@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/DMA/IR/DMADialect.h"
 #include "mlir/Dialect/DMA/IR/DMAOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Snitch/IR/SnitchAttrs.h"
 #include "mlir/Dialect/Snitch/IR/SnitchDialect.h"
 #include "mlir/Dialect/Snitch/IR/SnitchOps.h"
@@ -54,17 +55,43 @@ using namespace mlir;
 using namespace mlir::snitch;
 using namespace mlir::dma;
 
+/// If 'value' is a region iter_arg of an 'scf.for' (possibly through several
+/// nested loops), returns the init operand of the outermost such loop.
+/// Returns null otherwise.
+static OpOperand *getOutermostLoopInit(Value value) {
+  OpOperand *init = nullptr;
+  while (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+    if (!forOp || blockArg == forOp.getInductionVar())
+      break;
+    init = forOp.getTiedLoopInit(blockArg);
+    value = init->get();
+  }
+  return init;
+}
+
 void PromoteOperandsToL1::runOnOperation() {
   // Copy all tensors used as operands to compute ops into L1 memory.
   getOperation()->walk([&](TilingInterface computeOp) {
     // Note: This can create redundant copies that must be cleaned up by CSE.
     SmallVector<OpOperand *> nonL1Uses;
-    for (OpOperand &operand : computeOp->getOpOperands())
-      if (isa<RankedTensorType>(operand.get().getType()))
-        nonL1Uses.push_back(&operand);
+    for (OpOperand &operand : computeOp->getOpOperands()) {
+      if (!isa<RankedTensorType>(operand.get().getType()))
+        continue;
 
-    auto builder = OpBuilder(computeOp);
+      // A loop-carried operand (e.g. an accumulator hoisted by
+      // 'snitch-hoist-reduction-accumulator') is copied into L1 once, at the
+      // loop entry, rather than on every iteration.
+      if (OpOperand *loopInit = getOutermostLoopInit(operand.get())) {
+        if (!loopInit->get().getDefiningOp<WaitForTensorCopyOp>())
+          nonL1Uses.push_back(loopInit);
+        continue;
+      }
+      nonL1Uses.push_back(&operand);
+    }
+
     for (OpOperand *use : nonL1Uses) {
+      auto builder = OpBuilder(use->getOwner());
       auto copyOp = builder.create<StartTensorCopyOp>(
           computeOp.getLoc(),
           /*copy=*/use->get(), builder.getAttr<L1EncodingAttr>());

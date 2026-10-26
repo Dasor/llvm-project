@@ -13,5 +13,6 @@ class RewritePatternSet;
 void populateSnitchToLLVMConversionPatterns(mlir::ModuleOp moduleOp,
                                             mlir::LLVMTypeConverter &converter,
                                             mlir::RewritePatternSet &patterns,
-                                            unsigned barrierParticipants = 2);
+                                            unsigned barrierParticipants = 2,
+                                            bool hwBarrier = false);
 } // namespace mlir

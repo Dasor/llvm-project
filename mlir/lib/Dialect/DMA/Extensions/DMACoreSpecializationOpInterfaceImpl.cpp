@@ -56,7 +56,15 @@ struct WaitForTransferOpImpl
     rewriter.eraseOp(op);
   }
 
-  bool needsSynchronization(Operation *op) const { return true; }
+  /// Waiting for a transfer the compute cores consume requires a barrier.
+  /// Waiting for a zero-fill does not: it only orders the zero-fill before the
+  /// copy into the same buffer (see 'StartTensorCopyOp::bufferize'), and the
+  /// compute cores synchronize on the wait for that copy.
+  bool needsSynchronization(Operation *op) const {
+    return !cast<WaitForTransferOp>(op)
+                .getToken()
+                .getDefiningOp<StartZeroMemTransferOp>();
+  }
 };
 
 struct WaitForTransferOpDMAImpl

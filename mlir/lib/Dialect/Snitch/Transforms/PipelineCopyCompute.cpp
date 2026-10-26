@@ -7,6 +7,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Snitch/IR/SnitchDialect.h"
 #include "mlir/Dialect/Snitch/IR/SnitchOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/TilingInterface.h"
 
 namespace mlir::snitch {
@@ -81,6 +83,36 @@ static PipelineOp liftToPipeline(scf::ForOp forOp) {
   return pipelineOp;
 }
 
+/// Returns true if 'extractOp', reading from the region iter_arg 'iterArg' of
+/// 'forOp', reads a subset that no other iteration writes: the loop yields
+/// 'tensor.insert_slice ... into iterArg' at the same subset, and the subset
+/// varies with the iteration (as for the output tile of a loop tiling a
+/// parallel dimension). The copy of iteration i+1 then reads data that the
+/// computation of iteration i does not write.
+static bool readsPerIterationSubset(scf::ForOp forOp, BlockArgument iterArg,
+                                    tensor::ExtractSliceOp extractOp) {
+  if (extractOp.getSource() != iterArg)
+    return false;
+  auto insertOp = forOp.getTiedLoopYieldedValue(iterArg)
+                      ->get()
+                      .getDefiningOp<tensor::InsertSliceOp>();
+  if (!insertOp || insertOp.getDest() != iterArg)
+    return false;
+  auto sameValues = [](ArrayRef<OpFoldResult> lhs, ArrayRef<OpFoldResult> rhs) {
+    return llvm::equal(lhs, rhs, [](OpFoldResult l, OpFoldResult r) {
+      return isEqualConstantIntOrValue(l, r);
+    });
+  };
+  if (!sameValues(extractOp.getMixedOffsets(), insertOp.getMixedOffsets()) ||
+      !sameValues(extractOp.getMixedSizes(), insertOp.getMixedSizes()) ||
+      !sameValues(extractOp.getMixedStrides(), insertOp.getMixedStrides()))
+    return false;
+  // A loop-invariant subset is read and written by every iteration.
+  return !llvm::all_of(extractOp.getOffsets(), [&](Value offset) {
+    return forOp.isDefinedOutsideOfLoop(offset);
+  });
+}
+
 static void pipelineForLoop(scf::ForOp forOp) {
   // Compute the set of operations that we want to move into the first stage,
   // the copy stage, by calculating the backward slice from the
@@ -117,6 +149,27 @@ static void pipelineForLoop(scf::ForOp forOp) {
   }
   if (!llvm::all_of(toMove, isPure))
     return;
+
+  // The copy stage of iteration i+1 runs concurrently with the compute stage
+  // of iteration i. A copy depending on a loop-carried value (e.g. the output
+  // tile of a reduction loop that is copied in and out on every iteration)
+  // would read it before the previous iteration produced it. Reading a subset
+  // that only the same iteration writes back is fine.
+  for (Operation *op : toMove) {
+    for (Value operand : op->getOperands()) {
+      auto blockArg = dyn_cast<BlockArgument>(operand);
+      if (!blockArg || blockArg.getOwner() != forOp.getBody() ||
+          blockArg == forOp.getInductionVar())
+        continue;
+      if (auto extractOp = dyn_cast<tensor::ExtractSliceOp>(op))
+        if (readsPerIterationSubset(forOp, blockArg, extractOp))
+          continue;
+      InFlightDiagnostic diag = forOp.emitWarning(
+          "not pipelining loop: a copy depends on a loop-carried value");
+      diag.attachNote(op->getLoc()) << "copy computed here";
+      return;
+    }
+  }
 
   PipelineOp pipelineOp = liftToPipeline(forOp);
   forOp.replaceAllUsesWith(pipelineOp.getResults());

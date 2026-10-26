@@ -1816,6 +1816,11 @@ def ConvertSnitchToLLVMPass : Pass<"convert-snitch-to-llvm", "mlir::ModuleOp"> {
            "rendezvous. SpecializeDMACode currently only ever produces a "
            "compute-core clone and a DM-core clone synchronizing with each "
            "other, so this defaults to 2.">,
+    Option<"hwBarrier", "hw-barrier", "bool", "false",
+           "Lower snitch.barrier to the cluster's hardware barrier (CSR "
+           "0x7c2) instead of the software barrier on _snrt_barrier. Only "
+           "correct if all harts of the cluster execute every barrier, i.e. "
+           "barrier-participants is the number of harts in the cluster.">,
   ];
 }
 

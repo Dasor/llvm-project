@@ -33,10 +33,10 @@ SB_ROOT = Path(__file__).resolve().parent
 
 # Hardware/pipeline constants that are still fixed (not command-line options).
 CORES = 8                          # compute harts in the default Snitch cluster
-BARRIER_PARTICIPANTS = CORES + 1   # compute harts + the DM hart
+BARRIER_PARTICIPANTS = CORES + 1   # compute harts + the DM hart: the whole cluster
 LIBRARY_UNROLL = 8                 # gemm_fp64_opt's unroll along N
-PIPELINED_INTERCHANGE = [2, 0, 1]  # K outermost: snitch-pipeline-copy-compute
-                                   # can't pipeline the reduction loop otherwise
+STAGGER_MIN_BLOCKS = 4             # stagger column blocks per hart from this many
+COALESCE_ATTR = "snitch.coalesce_tile_loops"  # marks the M tile loop to coalesce
 ELEM_TYPE = "f64"
 
 LLC_FLAGS = ["-mtriple=riscv32-unknown-unknown-elf", "-mcpu=generic-rv32",
@@ -117,17 +117,17 @@ def validate(cfg):
                             ("k", "K", cfg.k, cfg.K)]:
         if t > d:
             errors.append(f"tile {tile}={t} is larger than {dim}={d}")
-    # Current compiler limitations (found empirically): with no tiling loop
+    # Current compiler limitation (found empirically): with no tiling loop
     # left, bufferization of the L1 copy of C fails ("would write to read-only
-    # buffer"); dual-buffering additionally needs at least two tiled loops,
-    # otherwise snitch.pipeline fails to bufferize (or, with none, no pipeline
-    # is formed at all).
+    # buffer").
     split = sum(t < d for t, d in [(cfg.m, cfg.M), (cfg.n, cfg.N), (cfg.k, cfg.K)])
-    min_split = 2 if cfg.pipelined else 1
-    if split < min_split:
-        errors.append(f"{'pipelined' if cfg.pipelined else 'non-pipelined'} mode needs "
-                      f"at least {min_split} of M, N, K split into more than one tile "
-                      f"(tile < dimension), got {split}")
+    if split < 1:
+        errors.append("at least one of M, N, K must be split into more than one "
+                      "tile (tile < dimension)")
+    # Dual-buffering pipelines the innermost (K) tiling loop.
+    if cfg.pipelined and cfg.k >= cfg.K:
+        errors.append(f"pipelined mode needs K split into more than one tile, "
+                      f"got k={cfg.k} >= K={cfg.K}")
     if cfg.m % CORES:
         errors.append(f"m={cfg.m} must be a multiple of the {CORES} compute cores "
                       f"(thread-tiling along M)")
@@ -167,6 +167,32 @@ def which(tool, env):
     return None
 
 
+def full_trace(env):
+    """SNITCH_FULL_TRACE=1 selects the Verilator model that traces every hart
+    (compute-core profiling), instead of the default DMA-hart-only one."""
+    return env.get("SNITCH_FULL_TRACE") == "1"
+
+
+def prefetch_tiles(env):
+    """Prefetch the next output tile's first A/B tiles during the current
+    tile's last K step (snitch-lower-pipeline-op's prefetch-across-iterations,
+    plus coalescing of the M/N tile loops). GEMM_PREFETCH=0 turns it off, for
+    before/after comparisons."""
+    return env.get("GEMM_PREFETCH") != "0"
+
+
+def hw_barrier(env):
+    """Lower snitch.barrier to the cluster's hardware barrier instead of the
+    runtime's software barrier, whose counter is in L3. Legal because every
+    barrier is a rendezvous of all BARRIER_PARTICIPANTS harts, i.e. the whole
+    cluster. GEMM_HW_BARRIER=0 turns it off, for before/after comparisons."""
+    return env.get("GEMM_HW_BARRIER") != "0"
+
+
+def verilator_model(env):
+    return env["SNITCH_CLUSTER_VLT_FULLTRACE" if full_trace(env) else "SNITCH_CLUSTER_VLT"]
+
+
 def check_tools(cfg, env):
     required = {
         env["MLIR_OPT"]: "run ./build.sh first",
@@ -182,7 +208,9 @@ def check_tools(cfg, env):
         required[f"{env['SNITCH_TOOLCHAIN']}/bin/clang"] = \
             "rebuild the docker image (Dockerfile's snitch_toolchain stage)"
     if cfg.simulator == "verilator":
-        required[env["SNITCH_CLUSTER_VLT"]] = "run ./build.sh --verilator first"
+        required[verilator_model(env)] = (
+            "build the full-trace model (see env.sh)" if full_trace(env)
+            else "run ./build.sh --verilator first")
         if cfg.verify:
             required[f"{env['VENV']}/bin/python3"] = "run ./build.sh first"
 
@@ -263,29 +291,61 @@ def _transform_module(body):
             "}\n")
 
 
-def gen_tile_transform(cfg, path):
-    """L1 tiling: tile, then pad each per-tile matmul up to the full tile size,
-    so non-divisible sizes still give every tile a uniform static shape (the
-    dual-buffered L1 allocations must be static). Pipelined: tile with K
-    outermost and mark the tile for dual-buffering."""
+def gen_tile_transform(cfg, env, path):
+    """L1 tiling: tile (M, N, K, K innermost). Remainder tiles along M and N
+    are computed at their real size: the last iteration of each M/N tile loop
+    is peeled, giving it its own loop nest with static, smaller shapes (and
+    its own microkernel). Only K is padded, up to the full k (the
+    dual-buffered K loop needs uniform static tiles); M up to a multiple of
+    the cores (thread-tiling) and, for the library microkernel, N up to a
+    multiple of its unroll factor. Pipelined: mark every tile for
+    dual-buffering of its K loop."""
     tiles = f"[{cfg.m}, {cfg.n}, {cfg.k}]"
+    pad_multiples = (f"[{CORES}, {LIBRARY_UNROLL if cfg.microkernel == 'library' else 1}, "
+                     f"{cfg.k}]")
     four_ops = ("(!transform.any_op) -> (!transform.any_op, !transform.any_op, "
                 "!transform.any_op, !transform.any_op)")
     zero = f"0.0 : {ELEM_TYPE}"
-    interchange = (f"      interchange = {PIPELINED_INTERCHANGE}\n"
-                   if cfg.pipelined else "")
-    # Pipelined: no materialize_in_destination copy-back. Its destination (the
-    # L3 slice of C) crosses from the copy to the compute stage as a block
-    # argument, so bufferization can't prove the tiling's insert_slice is in
-    # place and emits a second, L3->L3 self-copy of every C tile, which hangs
-    # the DMA on Verilator. The insert_slice alone writes the tile back.
+    # Pipelined: no materialize_in_destination copy-back; the insert_slice
+    # alone writes the tile back. (snitch-hoist-reduction-accumulator drops a
+    # per-K-iteration copy-back anyway. If it did not apply, the copy-back's
+    # destination would cross pipeline stages as a block argument, and
+    # bufferization would add an L3->L3 self-copy of every C tile, which
+    # hangs the DMA on Verilator.)
     copy_back = '      copy_back_op = "none",\n' if cfg.pipelined else ""
     body = (f"    %tiled, %l0, %l1, %l2 = transform.structured.tile_using_for %mm"
             f" tile_sizes {tiles}\n"
-            f"{interchange}"
-            f"      : {four_ops}\n"
-            f"    %padded, %pad, %copy_back = transform.structured.pad %tiled"
-            f" pad_to_multiple_of {tiles} {{\n"
+            f"      : {four_ops}\n")
+    # Peel the inner (N) loop first; peeling the M loop then also clones the
+    # peeled N nest into the M remainder.
+    peeled = set()
+    for loop, tile, dim in [("%l1", cfg.n, cfg.N), ("%l0", cfg.m, cfg.M)]:
+        if dim % tile == 0 or tile >= dim:
+            continue
+        peeled.add(loop)
+        name = loop[1:]
+        body += (f"    %{name}_for = transform.cast {loop} : !transform.any_op to "
+                 "!transform.op<\"scf.for\">\n"
+                 f"    %{name}_main, %{name}_rem = transform.loop.peel %{name}_for : "
+                 "(!transform.op<\"scf.for\">) -> (!transform.any_op, !transform.any_op)\n")
+    if cfg.pipelined and prefetch_tiles(env) and "%l1" not in peeled:
+        # The (main) M and N tile loops are perfectly nested: mark the M loop
+        # so coalesce_tile_loops makes them one loop over output tiles, which
+        # the next tile's first A/B copy is then prefetched across.
+        outer = "%l0_main" if "%l0" in peeled else "%l0"
+        body += f"    transform.annotate {outer} \"{COALESCE_ATTR}\" : !transform.any_op\n"
+    if peeled:
+        # Fold the peeled tiles' sizes to constants before padding, which would
+        # otherwise pad them to their upper bound, the full tile size.
+        body += ("    %func = transform.structured.match ops{[\"func.func\"]} in %arg0"
+                 " : (!transform.any_op) -> !transform.any_op\n"
+                 "    transform.apply_patterns to %func {\n"
+                 "      transform.apply_patterns.canonicalization\n"
+                 "    } : !transform.any_op\n")
+    body += ("    %tiles = transform.structured.match ops{[\"linalg.matmul\"]} in %arg0"
+             " : (!transform.any_op) -> !transform.any_op\n"
+             f"    %padded, %pad, %copy_back = transform.structured.pad %tiles"
+             f" pad_to_multiple_of {pad_multiples} {{\n"
             f"{copy_back}"
             f"      padding_values = [{zero}, {zero}, {zero}],\n"
             "      padding_dimensions = [0, 1, 2]\n"
@@ -320,7 +380,17 @@ def tile_and_promote(cfg, r, src):
     thread-tiling. Promotion/pipelining must precede thread-tiling so all
     cores share one DMA'd-in L1 tile."""
     tiled = transform(r, "tile to L1", src, r.path("step1a_l1_tiled.mlir"),
-                      gen_tile_transform(cfg, r.path("tile_l1.mlir")))
+                      gen_tile_transform(cfg, r.env, r.path("tile_l1.mlir")))
+    # Keep the C tile live across the K loop: padded and copied into L1 once
+    # per (M, N) tile, written back once, instead of every K iteration. This
+    # also leaves the K loop's copies (A and B) free of loop-carried
+    # dependences, so it can be dual-buffered.
+    tiled = r.mlir_opt(
+        "hoist C accumulator out of the K loop", tiled, r.path("step1a2_hoisted.mlir"),
+        "--pass-pipeline=builtin.module(func.func(snitch-hoist-reduction-accumulator,"
+        "cse,canonicalize))")
+    if cfg.pipelined and prefetch_tiles(r.env):
+        tiled = coalesce_tile_loops(r, tiled)
     # promote-pads-to-l1 must run before promote-operands-to-l1 so the
     # padded tile's L1 copy is the padding-aware fused DMA copy.
     promoted = r.mlir_opt(
@@ -333,13 +403,35 @@ def tile_and_promote(cfg, r, src):
             "--pass-pipeline=builtin.module(func.func(snitch-pipeline-copy-compute))")
         # The tensor-level ordering (pipeline-copy-compute strictly before
         # thread-tiling) is load-bearing and fails silently if reversed.
-        count = promoted.read_text().count("snitch.pipeline ")
-        if count != 1:
-            raise PipelineError(f"expected exactly 1 snitch.pipeline op after "
-                                f"pipelining, got {count}")
+        # One pipeline per tile loop nest (several with peeled remainders).
+        text = promoted.read_text()
+        count, tiles = text.count("snitch.pipeline "), text.count("linalg.matmul")
+        if count != tiles:
+            raise PipelineError(f"expected one snitch.pipeline op per tile loop "
+                                f"nest ({tiles}) after pipelining, got {count}")
     return transform(r, f"thread-tile across {CORES} cores", promoted,
                      r.path("step1d_thread_tiled.mlir"),
                      gen_thread_tile_transform(r.path("tile_threads.mlir")))
+
+
+def coalesce_tile_loops(r, src):
+    """Coalesce the M and N tile loops marked by gen_tile_transform into one
+    loop over output tiles. Runs after accumulator hoisting: before it, the K
+    loop is perfectly nested in them too and would be coalesced as well."""
+    library = r.path("coalesce.mlir")
+    library.write_text(
+        "module attributes {transform.with_named_sequence} {\n"
+        "  transform.named_sequence @__transform_main("
+        "%arg0: !transform.any_op {transform.readonly}) {\n"
+        f"    %loops = transform.structured.match ops{{[\"scf.for\"]}} "
+        f"attributes{{{COALESCE_ATTR}}} in %arg0 : (!transform.any_op) -> !transform.any_op\n"
+        "    %coalesced = transform.loop.coalesce %loops : "
+        "(!transform.any_op) -> !transform.any_op\n"
+        "    transform.yield\n"
+        "  }\n"
+        "}\n")
+    return transform(r, "coalesce output-tile loops", src,
+                     r.path("step1a3_coalesced.mlir"), library)
 
 
 def form_microkernels(r, src):
@@ -353,8 +445,10 @@ def bufferize(cfg, r, src):
     out = r.mlir_opt("bufferize", src, r.path("step2a_bufferized.mlir"),
                      "--snitch-bufferize=use-dma-memcpy=true", "--cse", "--canonicalize")
     if cfg.pipelined:
+        prefetch = "true" if prefetch_tiles(r.env) else "false"
         out = r.mlir_opt("lower pipeline op", out, r.path("step2b_pipeline_lowered.mlir"),
-                         "--snitch-lower-pipeline-op", "--cse", "--canonicalize")
+                         f"--snitch-lower-pipeline-op=prefetch-across-iterations={prefetch}",
+                         "--cse", "--canonicalize")
     return r.mlir_opt("lower scf.forall", out, r.path("step2c_forall_lowered.mlir"),
                       f"--snitch-lower-forall-op=compute-cores={CORES}",
                       "--cse", "--canonicalize")
@@ -386,7 +480,8 @@ def lower_to_llvm(r, src):
     return r.mlir_opt(
         "lower to LLVM dialect", src, r.path("step6_llvm.mlir"),
         "--convert-scf-to-cf",
-        f"--convert-snitch-to-llvm=barrier-participants={BARRIER_PARTICIPANTS}",
+        f"--convert-snitch-to-llvm=barrier-participants={BARRIER_PARTICIPANTS} "
+        f"hw-barrier={'true' if hw_barrier(r.env) else 'false'}",
         "--convert-dma-to-llvm", "--expand-strided-metadata", "--lower-affine",
         f"--finalize-memref-to-llvm={INDEX_BW}", f"--convert-arith-to-llvm={INDEX_BW}",
         f"--convert-cf-to-llvm={INDEX_BW}",
@@ -447,20 +542,53 @@ def patch_upstream_gemm(r):
     return inc
 
 
+_MEMREF_RE = re.compile(r"memref<(\d+)x(\d+)xf64(?:, strided<\[(\d+), 1\][^>]*>)?")
+
+
+def microkernel_shapes(riscv_mlir):
+    """{symbol: (M, N, K, lda, ldb, ldc)} for every per-hart microkernel call
+    in the xDSL-converted module (A is MxK, B KxN, C MxN; ld* are the row
+    strides). With peeled remainder tiles, kernels differ in shape."""
+    shapes = {}
+    for line in riscv_mlir.read_text().splitlines():
+        m = re.search(r'snitch\.call_microkernel "([^"]+)"\(.*?\) : (.*)$', line)
+        if not m:
+            continue
+        (am, ak, lda), (bk, bn, ldb), (cm, cn, ldc) = [
+            (int(t[0]), int(t[1]), int(t[2]) if t[2] else int(t[1]))
+            for t in _MEMREF_RE.findall(m.group(2))[:3]]
+        assert am == cm and ak == bk and bn == cn, f"inconsistent shapes in {line}"
+        shapes[m.group(1)] = (am, bn, ak, lda, ldb, ldc)
+    return shapes
+
+
 def build_library_kernels(cfg, r, llvm_mlir):
     sw = Path(r.env["SNITCH_CLUSTER_ROOT"], "sw")
     includes = [f"-I{patch_upstream_gemm(r)}", *(f"-I{sw / d}" for d in SNITCH_SW_INCLUDES)]
-    defines = [f"-DTILE_M={cfg.m // CORES}", f"-DTILE_N={cfg.n}", f"-DTILE_K={cfg.k}"]
+    shapes = microkernel_shapes(r.path("step5_riscv.mlir"))
+    defines = []
     if cfg.simulator == "gvsoc":
         # See gemm_library_kernel.cpp: gvsoc drops SSR write-stream values
         # still queued when SSR is disabled.
         defines.append("-DSSR_DRAIN_WORKAROUND")
+    stagger = r.env.get("GEMM_STAGGER_N")  # "0"/"1" force it off/on
     objs = []
     for sym in kernel_symbols(llvm_mlir):
+        if sym not in shapes:
+            raise PipelineError(f"no microkernel call for {sym} in step5_riscv.mlir")
+        tile_m, tile_n, tile_k, lda, ldb, ldc = shapes[sym]
+        # Per-hart rotation of the column-block order (gemm_library_kernel.cpp):
+        # measured -3.6 %/-3.9 % with 4/8 blocks of 8 columns, +0.6 % with 3.
+        if stagger == "1" or (stagger != "0" and tile_n // LIBRARY_UNROLL >= STAGGER_MIN_BLOCKS):
+            kernel_defines = [*defines, "-DSTAGGER_N"]
+        else:
+            kernel_defines = defines
         o = r.path(f"library_{sym.split('$')[-1]}.o")
-        r.run(f"compile library microkernel as {sym}",
+        r.run(f"compile library microkernel as {sym} ({tile_m}x{tile_n}x{tile_k} per hart)",
               [f"{r.env['SNITCH_TOOLCHAIN']}/bin/clang", *SNITCH_CLANG_FLAGS, *includes,
-               *defines, f'-DKERNEL_SYMBOL="{sym}"', "-c",
+               *kernel_defines, f"-DTILE_M={tile_m}", f"-DTILE_N={tile_n}", f"-DTILE_K={tile_k}",
+               f"-DLDA={lda}", f"-DLDB={ldb}", f"-DLDC={ldc}",
+               f'-DKERNEL_SYMBOL="{sym}"', "-c",
                f"{r.env['KERNELS']}/gemm_library_kernel.cpp", "-o", o])
         objs.append(o)
     return objs
@@ -476,6 +604,23 @@ def build_microkernels(cfg, r, llvm_mlir):
 # Linking
 # --------------------------------------------------------------------------
 
+def gen_gemm_data(cfg, path):
+    """Compile-time inputs for gemm_main.c, placed in .data (an explicitly
+    zero-initialized C would otherwise land in .bss, which the runtime clears
+    on the simulated cores). The init pattern is mirrored by
+    verify_gemm_ipc.py's expected_result."""
+    def array(name, size, values):
+        body = ",".join(f"{v}.0" for v in values)
+        return (f'double {name}[{size}] __attribute__((section(".data"))) = '
+                f"{{{body}}};\n")
+    path.write_text(
+        "// Generated by run_gemm.py (gen_gemm_data). Do not edit.\n"
+        + array("gemm_a", "M * K", ((i % 7) + 1 for i in range(cfg.M * cfg.K)))
+        + array("gemm_b", "K * N", ((i % 5) + 1 for i in range(cfg.K * cfg.N)))
+        + array("gemm_c", "M * N", (0 for _ in range(cfg.M * cfg.N))))
+    return path
+
+
 def link_executable(cfg, r, llvm_obj, kernel_objs):
     tc = r.env["TOOLCHAIN"]
     snrt = r.env["SNRT"]
@@ -487,8 +632,10 @@ def link_executable(cfg, r, llvm_obj, kernel_objs):
     if cfg.verify and cfg.simulator == "gvsoc":
         # On Verilator, run_verilator verifies on the host instead.
         defines.append("-DVERIFY")
+    gen_gemm_data(cfg, r.path("gemm_data.h"))
     r.run("compile gemm_main.c",
-          [f"{tc}/bin/clang", "-isystem", f"{snrt}/include", *defines, *MAIN_CFLAGS,
+          [f"{tc}/bin/clang", "-isystem", f"{snrt}/include", f"-I{r.work}",
+           *defines, *MAIN_CFLAGS,
            "-o", main_obj, "-c", f"{r.env['KERNELS']}/gemm_main.c"])
 
     elf = r.path("gemm.elf")
@@ -527,7 +674,7 @@ def run_verilator(cfg, r, elf):
     sim_dir = r.path("verilator")
     sim_dir.mkdir(exist_ok=True)
     log = sim_dir / "run.log"
-    cmd = [r.env["SNITCH_CLUSTER_VLT"], elf]
+    cmd = [verilator_model(r.env), elf]
     if cfg.verify:
         # Launches the model itself and checks C on the host over IPC.
         cmd = [f"{r.env['VENV']}/bin/python3", SB_ROOT / "verify_gemm_ipc.py", *cmd,

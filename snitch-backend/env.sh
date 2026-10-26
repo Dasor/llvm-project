@@ -23,6 +23,11 @@ OUT="${OUT:-$SB_ROOT/out}"
 SNITCH_CLUSTER_ROOT="$SB_ROOT/snitch_cluster"
 SNITCH_CLUSTER_VENV="$SNITCH_CLUSTER_ROOT/.venv"
 SNITCH_CLUSTER_VLT="$SNITCH_CLUSTER_ROOT/target/sim/build/bin/snitch_cluster_bin.vlt"
+# Opt-in model tracing every hart, not just the DMA hart (for profiling compute
+# cores; slower and much larger traces). Built into target/sim/build-fulltrace
+# by `make verilator` without TRACE_DMA_ONLY. run_gemm.py uses it when
+# SNITCH_FULL_TRACE=1.
+SNITCH_CLUSTER_VLT_FULLTRACE="$SNITCH_CLUSTER_ROOT/target/sim/build-fulltrace/bin/snitch_cluster_bin.vlt"
 
 MLIR_OPT="$LLVM_BUILD/bin/mlir-opt"
 MLIR_TRANSLATE="$LLVM_BUILD/bin/mlir-translate"
@@ -35,5 +40,5 @@ export UV_CACHE_DIR="$SB_ROOT/build/.uv-cache"
 export PATH="$VENV/bin:$GVSOC_WORKDIR/install/bin:$PATH"
 
 export SB_ROOT LLVM_ROOT LLVM_BUILD VENV GVSOC_ROOT GVSOC_WORKDIR TOOLCHAIN SNITCH_TOOLCHAIN SNRT RISCV_OPCODES KERNELS OUT
-export SNITCH_CLUSTER_ROOT SNITCH_CLUSTER_VENV SNITCH_CLUSTER_VLT
+export SNITCH_CLUSTER_ROOT SNITCH_CLUSTER_VENV SNITCH_CLUSTER_VLT SNITCH_CLUSTER_VLT_FULLTRACE
 export MLIR_OPT MLIR_TRANSLATE LLC XDSL_OPT

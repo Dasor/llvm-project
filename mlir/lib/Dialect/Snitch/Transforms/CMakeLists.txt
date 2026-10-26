@@ -1,6 +1,7 @@
 add_mlir_dialect_library(MLIRSnitchTransforms
   Bufferize.cpp
   FormMicrokernels.cpp
+  HoistReductionAccumulator.cpp
   LowerForallOp.cpp
   LowerL1Allocations.cpp
   LowerPipelineOp.cpp
@@ -31,5 +32,6 @@ add_mlir_dialect_library(MLIRSnitchTransforms
   MLIRSCFDialect
   MLIRTensorDialect
   MLIRTilingInterface
+  MLIRTransformUtils
   MLIRUBDialect
   )

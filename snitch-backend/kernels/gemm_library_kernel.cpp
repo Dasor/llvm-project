@@ -8,13 +8,14 @@
 // This file exports exactly one such symbol, KERNEL_SYMBOL; run_gemm.py
 // compiles it once per symbol it finds in the lowered LLVM-dialect module.
 //
-// Shapes come from the L1 tile sizes and the 8-way thread-tiling of the M
-// dimension, passed in as -D flags by run_gemm.py:
-//   A: TILE_M x TILE_K slice (row stride TILE_K)
-//   B: TILE_K x TILE_N       (row stride TILE_N)
-//   C: TILE_M x TILE_N slice (row stride TILE_N)
-// C is always accumulated into (beta=1); it is zeroed once via a separate DMA
-// transfer before the K-tile loop, not by this microkernel.
+// Shapes are this kernel's per-hart tile (the L1 tile, or a peeled
+// remainder tile, after the 8-way thread-tiling of M), read by run_gemm.py
+// from the microkernel call's memref types and passed in as -D flags:
+//   A: TILE_M x TILE_K slice (row stride LDA)
+//   B: TILE_K x TILE_N       (row stride LDB)
+//   C: TILE_M x TILE_N slice (row stride LDC)
+// C is always accumulated into (beta=1); it is copied into L1 (or zeroed)
+// once before the K-tile loop, not by this microkernel.
 //
 // Compiled as C++ with -D__TOOLCHAIN_LLVM__, like upstream: the runtime
 // headers use C++ features, and __TOOLCHAIN_LLVM__ selects the
@@ -24,6 +25,17 @@
 
 #if !defined(TILE_M) || !defined(TILE_N) || !defined(TILE_K) || !defined(KERNEL_SYMBOL)
 #error "TILE_M, TILE_N, TILE_K and KERNEL_SYMBOL must be defined (see run_gemm.py)"
+#endif
+// Row strides of A, B and C (elements). run_gemm.py passes them per kernel:
+// e.g. a peeled remainder tile's C is a slice of a wider L1 buffer.
+#ifndef LDA
+#define LDA TILE_K
+#endif
+#ifndef LDB
+#define LDB TILE_N
+#endif
+#ifndef LDC
+#define LDC TILE_N
 #endif
 
 // gvsoc workaround (defined by run_gemm.py only for simulator=gvsoc). gvsoc's
@@ -68,8 +80,25 @@ static inline double multiply_opt(double multiplicand, double multiplier) {
 
 void gemm_library_kernel(double *A, double *B, double *C) asm(KERNEL_SYMBOL);
 
-void gemm_library_kernel(double *A, double *B, double *C) {
+// Computes columns [n0, n0 + n) of this hart's C tile.
+static inline void gemm_columns(double *A, double *B, double *C, uint32_t n0,
+                                uint32_t n) {
     gemm_fp64_opt(/*setup_ssr=*/1, /*partition_banks=*/0, /*transa=*/0,
-                  /*transb=*/0, TILE_M, TILE_N, TILE_K, A, /*lda=*/TILE_K, B,
-                  /*ldb=*/TILE_N, /*beta=*/1, C, /*ldc=*/TILE_N);
+                  /*transb=*/0, TILE_M, n, TILE_K, A, /*lda=*/LDA, B + n0,
+                  /*ldb=*/LDB, /*beta=*/1, C + n0, /*ldc=*/LDC);
+}
+
+void gemm_library_kernel(double *A, double *B, double *C) {
+#ifdef STAGGER_N
+    // All harts stream the same B tile. Starting every hart at a different
+    // 8-column block (and wrapping around) spreads their concurrent B reads
+    // over different TCDM banks instead of having them chase each other
+    // through the same ones.
+    const uint32_t blocks = TILE_N / 8;
+    const uint32_t n0 = (snrt_cluster_core_idx() % blocks) * 8;
+    gemm_columns(A, B, C, n0, TILE_N - n0);
+    if (n0) gemm_columns(A, B, C, 0, n0);
+#else
+    gemm_columns(A, B, C, 0, TILE_N);
+#endif
 }

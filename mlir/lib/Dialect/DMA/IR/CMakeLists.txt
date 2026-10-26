@@ -14,11 +14,13 @@ add_mlir_dialect_library(MLIRDMADialect
 
   LINK_LIBS PUBLIC
   MLIRAffineDialect
+  MLIRArithDialect
   MLIRBufferizationDialect
   MLIRIR
   MLIRInferTypeOpInterface
   MLIRLinalgDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
   MLIRSideEffectInterfaces
   MLIRSupport
   )
