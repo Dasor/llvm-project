@@ -8,6 +8,7 @@ add_mlir_dialect_library(MLIRSnitchTransforms
   PipelineCopyCompute.cpp
   PromoteToL1.cpp
   SpecializeDMACode.cpp
+  SplitReductionRemainder.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Dialect/Snitch/Transforms

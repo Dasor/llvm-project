@@ -10,6 +10,33 @@ def FormMicrokernelsPass
   ];
 }
 
+def SplitReductionRemainderPass : Pass<"snitch-split-reduction-remainder"> {
+  let description = [{
+    Computes the remainder tile of a tiled reduction at its real size, without
+    giving up the uniform tiles that dual-buffering needs.
+
+    Matches a tensor-semantics linalg op with one reduction dimension directly
+    in an `scf.for` that tiles it with a step that doesn't divide its constant
+    trip range, whose inputs along the reduction dimension are `tensor.pad`s
+    up to the step. The op is replaced by an `scf.if` on the induction
+    variable: every iteration but the last runs the op as before; the last
+    runs a clone on `tensor.extract_slice`s of the padded inputs, cut down to
+    the remainder along the reduction dimension. The padding is then never
+    read, so the pads yield `ub.poison` instead: `snitch-promote-pads-to-l1`
+    lowers them to copies of only the valid part, with no zero-fill.
+
+    Run after `snitch-hoist-reduction-accumulator` and before L1 promotion.
+    Discardable attributes stay on the full-tile op only.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::ub::UBDialect",
+  ];
+}
+
 def HoistReductionAccumulatorPass : Pass<"snitch-hoist-reduction-accumulator"> {
   let description = [{
     Keeps the accumulator of a tiled compute op live across the innermost

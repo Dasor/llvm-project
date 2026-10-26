@@ -92,3 +92,51 @@ func.func @per_iteration_tile(%a: tensor<128x128xf64>, %b: tensor<128x128xf64>, 
   }
   return %r : tensor<128x128xf64>
 }
+
+// -----
+
+// K remainder split off by snitch-split-reduction-remainder: the compute ops
+// sit in an 'scf.if', the remainder one on slices of the copied tiles. The
+// copies still move to the copy stage, the slices stay with the compute.
+
+// CHECK-LABEL: func.func @split_remainder
+// CHECK:         snitch.pipeline {{.*}} inits(%{{.+}}) -> tensor<32x32xf64> {
+// CHECK-COUNT-2:   dma.start_tensor_copy
+// CHECK:           snitch.pipeline_yield
+// CHECK:         }, {
+// CHECK-NOT:       dma.start_tensor_copy
+// CHECK:           scf.if
+// CHECK:             linalg.matmul {snitch.dual_buffer}
+// CHECK:           } else {
+// CHECK-COUNT-2:     tensor.extract_slice
+// CHECK:             linalg.matmul
+// CHECK:           snitch.pipeline_yield
+#min = affine_map<(d0) -> (-d0 + 90, 24)>
+func.func @split_remainder(%a: tensor<32x90xf64>, %b: tensor<90x32xf64>, %cl1: tensor<32x32xf64>) -> tensor<32x32xf64> {
+  %c0 = arith.constant 0 : index
+  %c24 = arith.constant 24 : index
+  %c72 = arith.constant 72 : index
+  %c90 = arith.constant 90 : index
+  %r = scf.for %k = %c0 to %c90 step %c24 iter_args(%acc = %cl1) -> (tensor<32x32xf64>) {
+    %size = affine.min #min(%k)
+    %high = affine.apply affine_map<(d0) -> (-d0 + 24)>(%size)
+    %as = tensor.extract_slice %a[0, %k] [32, %size] [1, 1] : tensor<32x90xf64> to tensor<32x?xf64>
+    %al1, %at = dma.start_tensor_copy of %as to #snitch.l1_encoding pad with undef by [0, %high] : tensor<32x?xf64> -> tensor<32x24xf64>
+    %aw = dma.wait_for_tensor_copy of %as : tensor<32x?xf64> to %al1 using %at -> tensor<32x24xf64>
+    %bs = tensor.extract_slice %b[%k, 0] [%size, 32] [1, 1] : tensor<90x32xf64> to tensor<?x32xf64>
+    %bl1, %bt = dma.start_tensor_copy of %bs to #snitch.l1_encoding pad with undef by [%high, 0] : tensor<?x32xf64> -> tensor<24x32xf64>
+    %bw = dma.wait_for_tensor_copy of %bs : tensor<?x32xf64> to %bl1 using %bt -> tensor<24x32xf64>
+    %not_last = arith.cmpi ne, %k, %c72 : index
+    %m = scf.if %not_last -> (tensor<32x32xf64>) {
+      %full = linalg.matmul {snitch.dual_buffer} ins(%aw, %bw : tensor<32x24xf64>, tensor<24x32xf64>) outs(%acc : tensor<32x32xf64>) -> tensor<32x32xf64>
+      scf.yield %full : tensor<32x32xf64>
+    } else {
+      %ar = tensor.extract_slice %aw[0, 0] [32, 18] [1, 1] : tensor<32x24xf64> to tensor<32x18xf64>
+      %br = tensor.extract_slice %bw[0, 0] [18, 32] [1, 1] : tensor<24x32xf64> to tensor<18x32xf64>
+      %rem = linalg.matmul ins(%ar, %br : tensor<32x18xf64>, tensor<18x32xf64>) outs(%acc : tensor<32x32xf64>) -> tensor<32x32xf64>
+      scf.yield %rem : tensor<32x32xf64>
+    }
+    scf.yield %m : tensor<32x32xf64>
+  }
+  return %r : tensor<32x32xf64>
+}

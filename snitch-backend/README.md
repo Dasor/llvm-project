@@ -23,8 +23,8 @@ point at an equivalent toolchain checkout yourself.
 ```shell
 docker compose build
 docker compose run --rm snitch ./build.sh --all
-docker compose run --rm snitch ./run_gemm.py 32 32 32 16 16 16 true gvsoc xdsl true
-docker compose run --rm snitch ./run_gemm.py 32 32 32 16 16 16 true verilator xdsl true
+docker compose run --rm snitch ./run_gemm.py 32x32x32w16-16-16 --microkernel xdsl --simulator gvsoc
+docker compose run --rm snitch ./run_gemm.py 32x32x32w16-16-16 --microkernel xdsl --simulator verilator
 ```
 
 Expect `all 1024 values matched` at the end of each run.
@@ -34,31 +34,41 @@ Expect `all 1024 values matched` at the end of each run.
 A single driver compiles and runs every GEMM configuration:
 
 ```shell
-./run_gemm.py <N> <M> <K> <n> <m> <k> <pipelined> <simulator> <microkernel> <verify>
+./run_gemm.py <MxNxKwm-n-k> --microkernel xdsl|library --simulator gvsoc|verilator \
+              [--tiling remainder|pad] [--pipelined true|false] [--verify true|false] [--keep-trace]
 ```
 
 | Argument | Values | Meaning |
 |---|---|---|
-| `N M K` | positive ints | C (MxN) = A (MxK) @ B (KxN) |
-| `n m k` | positive ints | L1 tile size along N, M, K |
-| `pipelined` | `true`, `false` | dual-buffered DMA/compute pipelining |
-| `simulator` | `gvsoc`, `verilator` | fast ISS or cycle-accurate RTL model |
-| `microkernel` | `xdsl`, `library` | xDSL-generated asm, or snitch_cluster's `gemm_fp64.h` via `kernels/gemm_library_kernel.cpp` |
-| `verify` | `true`, `false` | check C against a reference: on gvsoc by the DM core (`gemm_main.c -DVERIFY`); on Verilator on the host by `verify_gemm_ipc.py`, which reads C out of simulated memory over the testbench IPC interface (no extra simulated cycles) |
+| `MxNxKwm-n-k` | e.g. `128x128x128w64-24-64` | C (MxN) = A (MxK) @ B (KxN), L1 tile m x n x k (the `many_gemms.sh` notation) |
+| `--microkernel` | `xdsl`, `library` | xDSL-generated asm, or snitch_cluster's `gemm_fp64.h` via `kernels/gemm_library_kernel.cpp` |
+| `--simulator` | `gvsoc`, `verilator` | fast ISS (correctness only) or cycle-accurate RTL model (performance) |
+| `--tiling` | `remainder` (default), `pad` | tiles that don't divide the problem are computed at their real size, or zero-padded to the full tile size |
+| `--pipelined` | `true` (default), `false` | dual-buffered DMA/compute pipelining |
+| `--verify` | `true` (default), `false` | check C against a reference: on gvsoc by the DM core (`gemm_main.c -DVERIFY`); on Verilator on the host by `verify_gemm_ipc.py`, which reads C out of simulated memory over the testbench IPC interface (no extra simulated cycles) |
+| `--keep-trace` | | Verilator: keep the DMA hart's trace after extracting the CSV (e.g. for `tools/trace_breakdown.py`) |
+
+On Verilator, the DMA hart's trace is turned into `verilator/logs/<config>.csv`
+with the same scripts as `many_gemms.sh` (`gen_trace.py`,
+`extractDataFromJsons2.py`); its `dma` column, printed at the end of the run,
+is the performance metric. This needs a snitch-aware `llvm-mc` at
+`out/snitch-llvm-mc`, which `snitch_cluster/myrtle-experiments/extract_dma_csv.sh`
+copies there once.
 
 Constraints (checked up front):
 - `m` must be a multiple of the 8 compute cores.
-- Dimensions need not be divisible by their tiles: remainder tiles are zero-padded up to the full tile size by the DMA copy into L1, in both modes.
+- Dimensions need not be divisible by their tiles. With `--tiling remainder`, M/N remainder tiles get their own peeled loop nest at their real size (M padded only to a multiple of 8, and N to a multiple of 8 for `library`), and the K remainder tile is computed at its real size in the last step of the (uniform, dual-buffered) K loop. With `--tiling pad`, remainder tiles are zero-padded to the full tile size by the DMA copy into L1.
 - At least one of M, N, K must be split into more than one tile, due to a current bufferization limitation.
 - Pipelined mode dual-buffers the K loop, so it needs `k < K`.
-- `library` needs `n % 8 == 0`.
+- `library` needs `n % 8 == 0`, `k >= 2` and a K remainder of at least 2.
 - `library` also needs `snitch_cluster/sw/runtime/impl/snitch_cluster_cfg.h`, which `./build.sh --verilator` generates.
 - A tile that doesn't fit in L1 fails in `snitch-lower-l1-allocations`. The C tile stays in L1 across the K loop (`snitch-hoist-reduction-accumulator`), so L1 holds A + B + C non-pipelined and 2·(A + B) + C pipelined (f64, 8 bytes per element; budget 112,640 bytes).
 - Pipelined mode also issues the next output tile's first A and B copies during the current tile's last K step, when the K loop has an even number of steps (see `PERFORMANCE.md`, Change 6). `GEMM_PREFETCH=0` turns this off.
 - `snitch.barrier` is lowered to the cluster's hardware barrier, since every barrier involves all 9 harts (see `PERFORMANCE.md`, Change 7). `GEMM_HW_BARRIER=0` selects the runtime's software barrier instead.
+- `GEMM_K_REMAINDER=0` pads the K remainder tile even with `--tiling remainder` (see `PERFORMANCE.md`, Change 8).
 
 All intermediates for a configuration go to
-`$OUT/gemm_M<M>_N<N>_K<K>_t<m>x<n>x<k>_<pipe|nopipe>_<microkernel>/`.
+`$OUT/gemm_<MxNxKwm-n-k>_<rem|pad>_<pipe|nopipe>_<microkernel>_<simulator>/`.
 
 For the (potentially long) `--reconfigure-llvm`, first-time gvsoc build, or
 the Verilator RTL build below, prefer a persistent container over `run --rm`

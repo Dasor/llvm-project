@@ -41,6 +41,14 @@ using namespace mlir::dma;
 /// infrastructure.
 static constexpr llvm::StringLiteral kDualBufferAttrName = "snitch.dual_buffer";
 
+/// Returns the 'scf.for' 'computeOp' is in, directly or through 'scf.if's.
+static scf::ForOp getEnclosingLoop(Operation *computeOp) {
+  Operation *parent = computeOp->getParentOp();
+  while (isa_and_nonnull<scf::IfOp>(parent))
+    parent = parent->getParentOp();
+  return dyn_cast_or_null<scf::ForOp>(parent);
+}
+
 /// Lifts an 'scf.for' op to a pipeline op with two stages.
 /// The body of the for loop gets placed in the second stage with all iter args
 /// forwarded from the first to the second stage.
@@ -119,7 +127,14 @@ static void pipelineForLoop(scf::ForOp forOp) {
   // 'wait_for_tensor_copy' operation. The wait operation will remain in the
   // compute stage.
   SetVector<Operation *> toMove;
-  for (auto computeOp : forOp.getOps<TilingInterface>()) {
+  // Compute ops directly in the loop body, or in an 'scf.if' in it (as split
+  // by 'snitch-split-reduction-remainder').
+  SmallVector<TilingInterface> computeOps;
+  forOp.getBody()->walk([&](TilingInterface computeOp) {
+    if (getEnclosingLoop(computeOp) == forOp)
+      computeOps.push_back(computeOp);
+  });
+  for (TilingInterface computeOp : computeOps) {
     BackwardSliceOptions options;
     options.omitBlockArguments = true;
     options.inclusive = true;
@@ -129,10 +144,16 @@ static void pipelineForLoop(scf::ForOp forOp) {
 
     for (Value operand : computeOp->getOperands()) {
       // TODO: This assumes the immediate operand of the compute op is the
-      //       wait operation rather than starting the backwards slice after the
-      //       wait operation. Ideally we should first do one backward slice to
-      //       discover the wait operations, then do the backward slice on its
-      //       transfer tensor.
+      //       wait operation (or a slice of it, as in a remainder tile split
+      //       off by 'snitch-split-reduction-remainder') rather than starting
+      //       the backwards slice after the wait operation. Ideally we should
+      //       first do one backward slice to discover the wait operations,
+      //       then do the backward slice on its transfer tensor.
+      while (auto extractOp = operand.getDefiningOp<tensor::ExtractSliceOp>()) {
+        if (!forOp->isProperAncestor(extractOp))
+          break;
+        operand = extractOp.getSource();
+      }
       auto tensorCopyWait = operand.getDefiningOp<WaitForTensorCopyOp>();
       if (!tensorCopyWait)
         continue;
@@ -223,7 +244,7 @@ void PipelineCopyCompute::runOnOperation() {
 
     // TODO: This creates an uncomfortably tight coupling between the
     //  pass pipeline and tiling and the dual buffering.
-    auto forOp = dyn_cast<scf::ForOp>(computeOp->getParentOp());
+    scf::ForOp forOp = getEnclosingLoop(computeOp);
     if (!forOp ||
         !llvm::all_of(forOp.getResultTypes(), llvm::IsaPred<RankedTensorType>))
       return;

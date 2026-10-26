@@ -1,28 +1,46 @@
 #!/usr/bin/env python3
 """Compile and run a tiled f64 GEMM (C = A @ B) on the Snitch cluster.
 
-    ./run_gemm.py <N> <M> <K> <n> <m> <k> <pipelined> <simulator> <microkernel> <verify>
+    ./run_gemm.py <MxNxKwm-n-k> --microkernel xdsl|library --simulator gvsoc|verilator
+                  [--tiling remainder|pad] [--pipelined true|false]
+                  [--verify true|false] [--keep-trace]
 
-A is MxK, B is KxN, C is MxN. (m, n, k) is the L1 tile size along (M, N, K);
-m is further split across the compute cores (thread-tiling), so each hart's
-microkernel works on an (m/CORES) x n x k tile.
+A is MxK, B is KxN, C is MxN. The configuration is written as in
+many_gemms.sh, e.g. 128x128x128w64-24-64: problem M x N x K, L1 tile
+m-n-k. m is further split across the compute cores (thread-tiling), so each
+hart's microkernel works on an (m/CORES) x n x k tile.
 
-  pipelined    true | false          dual-buffered DMA/compute pipelining
-  simulator    gvsoc | verilator     fast ISS or cycle-accurate RTL model
-  microkernel  xdsl | library        xDSL-generated asm, or the snitch_cluster
+  --microkernel  xdsl | library      xDSL-generated asm, or the snitch_cluster
                                      C BLAS kernel (gemm_fp64.h, wrapped by
                                      kernels/gemm_library_kernel.cpp)
-  verify       true | false          check C against a reference: on gvsoc, on
-                                     the DM core; on verilator, on the host
-                                     (verify_gemm_ipc.py reads C over the
-                                     testbench's IPC interface, costing no
-                                     simulated cycles)
+  --simulator    gvsoc | verilator   fast ISS (correctness only) or
+                                     cycle-accurate RTL model (performance)
+  --tiling       remainder | pad     tiles that don't divide the problem are
+                                     computed at their real size (default), or
+                                     zero-padded to the full tile size
+  --pipelined    true | false        dual-buffered DMA/compute pipelining
+                                     (default true)
+  --verify       true | false        check C against a reference (default
+                                     true): on gvsoc, on the DM core; on
+                                     verilator, on the host (verify_gemm_ipc.py
+                                     reads C over the testbench's IPC
+                                     interface, costing no simulated cycles)
+  --keep-trace                       Verilator: keep the DMA hart's trace
+                                     (multi-GB for large problems) after
+                                     extracting the CSV, e.g. for
+                                     tools/trace_breakdown.py
+
+On Verilator, the DMA hart's trace is turned into
+verilator/logs/<config>.csv by the same scripts as many_gemms.sh
+(gen_trace.py, extractDataFromJsons2.py); its "dma" column is the
+performance metric.
 
 Tool paths come from env.sh. Every intermediate is written to its own
 per-configuration directory under $OUT, so runs never clobber each other.
 """
 import argparse
 import os
+from csv import DictReader
 import re
 import subprocess
 import sys
@@ -54,26 +72,43 @@ SNITCH_SW_INCLUDES = ["runtime/impl", "runtime/api", "runtime/api/omp",
 UPSTREAM_GEMM = "kernels/blas/gemm/src/gemm_fp64.h"
 MAIN_CFLAGS = ["-g", "-O3", "-DNDEBUG", "-std=gnu11", "-Wno-undefined-inline"]
 INDEX_BW = "index-bitwidth=32"
+# many_gemms.sh's trace -> CSV scripts (snitch_cluster), as run by
+# myrtle-experiments/extract_dma_csv.sh.
+GEN_TRACE = "util/trace/gen_trace.py"
+EXTRACT_CSV = "myrtle-experiments/extractDataFromJsons2.py"
+DMA_TRACE = "trace_hart_00008.dasm"
 
 
 @dataclass
 class Config:
-    N: int
     M: int
+    N: int
     K: int
-    n: int
     m: int
+    n: int
     k: int
-    pipelined: bool
-    simulator: str
     microkernel: str
+    simulator: str
+    tiling: str
+    pipelined: bool
     verify: bool
+    keep_trace: bool
+
+    @property
+    def shape(self):
+        """The configuration in many_gemms.sh notation, e.g. 128x128x128w64-24-64."""
+        return f"{self.M}x{self.N}x{self.K}w{self.m}-{self.n}-{self.k}"
 
     @property
     def name(self):
+        tiling = "rem" if self.tiling == "remainder" else "pad"
         pipe = "pipe" if self.pipelined else "nopipe"
-        return (f"gemm_M{self.M}_N{self.N}_K{self.K}_t{self.m}x{self.n}x{self.k}"
-                f"_{pipe}_{self.microkernel}")
+        return f"gemm_{self.shape}_{tiling}_{pipe}_{self.microkernel}_{self.simulator}"
+
+    def has_remainder(self, tile, dim):
+        """Whether dim is tiled into a remainder tile that is computed at its
+        real size (tiling=remainder) instead of padded."""
+        return self.tiling == "remainder" and dim % tile != 0 and tile < dim
 
 
 class PipelineError(Exception):
@@ -97,18 +132,30 @@ def boolean(s):
     return s == "true"
 
 
+_SHAPE_RE = re.compile(r"(\d+)x(\d+)x(\d+)w(\d+)-(\d+)-(\d+)")
+
+
+def shape(s):
+    match = _SHAPE_RE.fullmatch(s)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"expected MxNxKwm-n-k (e.g. 128x128x128w64-24-64), got '{s}'")
+    return [positive_int(v) for v in match.groups()]
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name, help_ in [("N", "columns of B and C"), ("M", "rows of A and C"),
-                        ("K", "reduction dimension"), ("n", "L1 tile size along N"),
-                        ("m", "L1 tile size along M"), ("k", "L1 tile size along K")]:
-        p.add_argument(name, type=positive_int, help=help_)
-    p.add_argument("pipelined", type=boolean)
-    p.add_argument("simulator", choices=["gvsoc", "verilator"])
-    p.add_argument("microkernel", choices=["xdsl", "library"])
-    p.add_argument("verify", type=boolean)
-    return Config(**vars(p.parse_args(argv)))
+    p.add_argument("shape", type=shape, metavar="MxNxKwm-n-k")
+    p.add_argument("--microkernel", required=True, choices=["xdsl", "library"])
+    p.add_argument("--simulator", required=True, choices=["gvsoc", "verilator"])
+    p.add_argument("--tiling", default="remainder", choices=["remainder", "pad"])
+    p.add_argument("--pipelined", type=boolean, default=True)
+    p.add_argument("--verify", type=boolean, default=True)
+    p.add_argument("--keep-trace", action="store_true")
+    args = vars(p.parse_args(argv))
+    M, N, K, m, n, k = args.pop("shape")
+    return Config(M=M, N=N, K=K, m=m, n=n, k=k, **args)
 
 
 def validate(cfg):
@@ -137,6 +184,9 @@ def validate(cfg):
                           f"got n={cfg.n}")
         if cfg.k < 2:
             errors.append(f"library microkernel needs k >= 2, got k={cfg.k}")
+        if cfg.has_remainder(cfg.k, cfg.K) and cfg.K % cfg.k < 2:
+            errors.append(f"library microkernel needs the K remainder tile to be >= 2, "
+                          f"got K % k = {cfg.K % cfg.k}")
     if errors:
         raise PipelineError("invalid configuration:\n  " + "\n  ".join(errors))
 
@@ -189,6 +239,19 @@ def hw_barrier(env):
     return env.get("GEMM_HW_BARRIER") != "0"
 
 
+def split_k_remainder(env):
+    """tiling=remainder: compute the K remainder tile at its real size
+    (snitch-split-reduction-remainder) instead of zero-padding it.
+    GEMM_K_REMAINDER=0 turns it off, for before/after comparisons."""
+    return env.get("GEMM_K_REMAINDER") != "0"
+
+
+def snitch_llvm_mc(env):
+    """A snitch-aware llvm-mc for gen_trace.py, cached by extract_dma_csv.sh
+    (in snitch-backend/out/, whatever $OUT is)."""
+    return SB_ROOT / "out" / "snitch-llvm-mc"
+
+
 def verilator_model(env):
     return env["SNITCH_CLUSTER_VLT_FULLTRACE" if full_trace(env) else "SNITCH_CLUSTER_VLT"]
 
@@ -229,6 +292,18 @@ def check_tools(cfg, env):
         snitch_sim = Path(env["SNITCH_CLUSTER_ROOT"], "util/sim/SnitchSim.py")
         if not snitch_sim.is_file():
             missing.append(f"{snitch_sim} not found -- snitch_cluster submodule missing?")
+    if cfg.simulator == "verilator":
+        root = Path(env["SNITCH_CLUSTER_ROOT"])
+        for script in (GEN_TRACE, EXTRACT_CSV):
+            if not (root / script).is_file():
+                missing.append(f"{root / script} not found -- snitch_cluster submodule missing?")
+        if not os.access(Path(env["SNITCH_CLUSTER_VENV"], "bin/python3"), os.X_OK):
+            missing.append(f"{env['SNITCH_CLUSTER_VENV']}/bin/python3 not found -- "
+                           "needed by the trace extraction")
+        if not os.access(snitch_llvm_mc(env), os.X_OK):
+            missing.append(f"{snitch_llvm_mc(env)} not found -- copy a snitch-aware llvm-mc "
+                           "there (snitch_cluster/myrtle-experiments/extract_dma_csv.sh does "
+                           "this once, from the snitch_cluster-hw container)")
     if cfg.simulator == "gvsoc" and which("gvrun", env) is None:
         missing.append("gvrun not on PATH -- run ./build.sh first")
     if missing:
@@ -292,17 +367,27 @@ def _transform_module(body):
 
 
 def gen_tile_transform(cfg, env, path):
-    """L1 tiling: tile (M, N, K, K innermost). Remainder tiles along M and N
-    are computed at their real size: the last iteration of each M/N tile loop
-    is peeled, giving it its own loop nest with static, smaller shapes (and
-    its own microkernel). Only K is padded, up to the full k (the
-    dual-buffered K loop needs uniform static tiles); M up to a multiple of
+    """L1 tiling: tile (M, N, K, K innermost).
+
+    tiling=remainder: remainder tiles are computed at their real size. Along
+    M and N, the last iteration of a tile loop that doesn't divide its
+    dimension is peeled, giving it its own loop nest with static, smaller
+    shapes (and its own microkernel). M is still padded up to a multiple of
     the cores (thread-tiling) and, for the library microkernel, N up to a
-    multiple of its unroll factor. Pipelined: mark every tile for
-    dual-buffering of its K loop."""
+    multiple of its unroll factor. Along K, the tiles are padded up to the
+    full k, which keeps the dual-buffered K loop's tiles uniform, and
+    snitch-split-reduction-remainder then computes the last one on its valid
+    part only (see tile_and_promote).
+
+    tiling=pad: every tile is zero-padded up to the full tile size.
+
+    Pipelined: mark the K loop's tiles for dual-buffering."""
     tiles = f"[{cfg.m}, {cfg.n}, {cfg.k}]"
-    pad_multiples = (f"[{CORES}, {LIBRARY_UNROLL if cfg.microkernel == 'library' else 1}, "
-                     f"{cfg.k}]")
+    if cfg.tiling == "pad":
+        pad_multiples = tiles
+    else:
+        pad_multiples = (f"[{CORES}, {LIBRARY_UNROLL if cfg.microkernel == 'library' else 1}, "
+                         f"{cfg.k}]")
     four_ops = ("(!transform.any_op) -> (!transform.any_op, !transform.any_op, "
                 "!transform.any_op, !transform.any_op)")
     zero = f"0.0 : {ELEM_TYPE}"
@@ -320,7 +405,7 @@ def gen_tile_transform(cfg, env, path):
     # peeled N nest into the M remainder.
     peeled = set()
     for loop, tile, dim in [("%l1", cfg.n, cfg.N), ("%l0", cfg.m, cfg.M)]:
-        if dim % tile == 0 or tile >= dim:
+        if not cfg.has_remainder(tile, dim):
             continue
         peeled.add(loop)
         name = loop[1:]
@@ -389,6 +474,13 @@ def tile_and_promote(cfg, r, src):
         "hoist C accumulator out of the K loop", tiled, r.path("step1a2_hoisted.mlir"),
         "--pass-pipeline=builtin.module(func.func(snitch-hoist-reduction-accumulator,"
         "cse,canonicalize))")
+    if cfg.has_remainder(cfg.k, cfg.K) and split_k_remainder(r.env):
+        # The last K tile is computed on its valid part only, and the padding
+        # of the A/B tiles, never read any more, is not zero-filled.
+        tiled = r.mlir_opt(
+            "split off the K remainder tile", tiled, r.path("step1a2b_k_split.mlir"),
+            "--pass-pipeline=builtin.module(func.func(snitch-split-reduction-remainder,"
+            "cse,canonicalize))")
     if cfg.pipelined and prefetch_tiles(r.env):
         tiled = coalesce_tile_loops(r, tiled)
     # promote-pads-to-l1 must run before promote-operands-to-l1 so the
@@ -403,12 +495,13 @@ def tile_and_promote(cfg, r, src):
             "--pass-pipeline=builtin.module(func.func(snitch-pipeline-copy-compute))")
         # The tensor-level ordering (pipeline-copy-compute strictly before
         # thread-tiling) is load-bearing and fails silently if reversed.
-        # One pipeline per tile loop nest (several with peeled remainders).
-        text = promoted.read_text()
-        count, tiles = text.count("snitch.pipeline "), text.count("linalg.matmul")
+        # One pipeline per dual-buffered K loop (several with peeled M/N
+        # remainders; a split-off K remainder tile isn't marked).
+        tiles = r.path("step1b_promoted.mlir").read_text().count("snitch.dual_buffer")
+        count = promoted.read_text().count("snitch.pipeline ")
         if count != tiles:
-            raise PipelineError(f"expected one snitch.pipeline op per tile loop "
-                                f"nest ({tiles}) after pipelining, got {count}")
+            raise PipelineError(f"expected one snitch.pipeline op per dual-buffered "
+                                f"K loop ({tiles}) after pipelining, got {count}")
     return transform(r, f"thread-tile across {CORES} cores", promoted,
                      r.path("step1d_thread_tiled.mlir"),
                      gen_thread_tile_transform(r.path("tile_threads.mlir")))
@@ -701,11 +794,43 @@ def check_result(cfg, status, log):
                                 f"(log: {log})")
 
 
+def extract_csv(cfg, r):
+    """Turn the DMA hart's Verilator trace into <config>.csv, the way
+    extract_dma_csv.sh does for many_gemms.sh: gen_trace.py writes the hart's
+    perf JSON, extractDataFromJsons2.py the CSV (only the DMA hart is parsed:
+    its region-count checks of the compute harts assume gemm_boundary).
+    Returns the "dma" column, the cycle count of the whole program on the DMA
+    hart."""
+    logs = r.path("verilator") / "logs"
+    dasm = logs / DMA_TRACE
+    if not dasm.is_file():
+        raise PipelineError(f"{dasm} not found: no DMA hart trace to extract")
+    root = Path(r.env["SNITCH_CLUSTER_ROOT"])
+    python = Path(r.env["SNITCH_CLUSTER_VENV"], "bin/python3")
+    # extractDataFromJsons2.py looks for this exact file name.
+    perf_json = logs / "hart-trace_hart_00008-perf.json"
+    perf_json.unlink(missing_ok=True)
+    r.run("extract DMA hart perf JSON (gen_trace.py)",
+          [python, root / GEN_TRACE, dasm, "--mc-exec", snitch_llvm_mc(r.env),
+           "--mc-flags", "-disassemble -mcpu=snitch", "--dump-hart-perf", perf_json,
+           "-o", "/dev/null"])
+    csv = logs / f"{cfg.name}.csv"
+    csv.unlink(missing_ok=True)
+    r.run("extract CSV (extractDataFromJsons2.py)",
+          [python, root / EXTRACT_CSV, cfg.name, logs, cfg.M, cfg.N, cfg.K,
+           cfg.m, cfg.n, cfg.k, "1"])
+    if not cfg.keep_trace:
+        dasm.unlink()
+    with open(csv) as f:
+        return next(DictReader(f))["dma"], csv
+
+
 # --------------------------------------------------------------------------
 
 def describe(cfg):
     return (f"C[{cfg.M}x{cfg.N}] = A[{cfg.M}x{cfg.K}] @ B[{cfg.K}x{cfg.N}], "
             f"L1 tile {cfg.m}x{cfg.n}x{cfg.k} (MxNxK), {CORES} cores, "
+            f"{'remainder tiles' if cfg.tiling == 'remainder' else 'padded tiles'}, "
             f"{'dual-buffered' if cfg.pipelined else 'not pipelined'}, "
             f"{cfg.microkernel} microkernel, {cfg.simulator}")
 
@@ -735,12 +860,16 @@ def main(argv=None):
 
         status, log = run_simulator(cfg, r, elf)
         check_result(cfg, status, log)
+        if cfg.simulator == "verilator":
+            dma, csv = extract_csv(cfg, r)
     except PipelineError as e:
         print(f"[!] {e}", file=sys.stderr)
         return 1
 
     verdict = "verified" if cfg.verify else "ran (not verified)"
     print(f"[+] {verdict}: {describe(cfg)}")
+    if cfg.simulator == "verilator":
+        print(f"[+] dma={dma} cycles ({csv})")
     return 0
 
 

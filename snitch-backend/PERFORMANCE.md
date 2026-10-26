@@ -6,10 +6,10 @@ This log covers each change that makes the MLIR-compiled f64 GEMM (`run_gemm.py`
 
 - **Simulator.** Every number is a Verilator run (`simulator=verilator`). gvsoc is not cycle-accurate, so it is used only for correctness checks.
 - **Metric.** Cycles are the `dma` column that `snitch_cluster/myrtle-experiments/extract_dma_csv.sh` computes from the DMA hart's trace (`verilator/logs/trace_hart_00008.dasm`). This is the same metric `many_gemms.sh` uses for the hand-written `snitch_cluster` GEMM.
-  - `tools/perf_compare.sh N M K n m k` runs one configuration and prints this number.
+  - On Verilator, `run_gemm.py` runs the extraction itself (`gen_trace.py` + `extractDataFromJsons2.py`, as `extract_dma_csv.sh` does), writes `verilator/logs/<config>.csv` and prints `dma=<cycles>`. `tools/perf_compare.sh <MxNxKwm-n-k> [microkernel] [tiling]` wraps one such run from the host.
   - `tools/trace_breakdown.py <elf> <dasm> --M .. --N .. --K ..` splits the kernel into time per function, compute steps and synchronisation gaps.
 - **Setup.** Unless stated otherwise: C = A·B at 128×128×128, 8 compute cores, pipelined (double-buffered), `library` microkernel (`gemm_fp64_opt` from `snitch_cluster`).
-- **Tile notation.** Tiles are written M×N×K (m×n×k). `run_gemm.py` takes them in the order `n m k`.
+- **Tile notation.** Tiles are written M×N×K (m×n×k). `run_gemm.py` takes a configuration as `MxNxKwm-n-k` (the `many_gemms.sh` notation, e.g. `128x128x128w64-24-64`). Before Change 8 it took `N M K n m k` as separate arguments.
 - **Ideal.** The lower bound is 128³ / 8 cores = **262,144** cycles of FMAs per core.
 - **Reference.** `many_gemms.sh` runs the hand-written kernel (`sw/kernels/blas/gemm_boundary`). On the same 64×24×64 tile it takes **286,776** cycles.
 
@@ -30,6 +30,7 @@ All runs: 128×128×128, pipelined, library microkernel, Verilator, verified.
 
 - **Best tile overall:** 362,176 cycles at the baseline (32×32×64) → 304,776 after Change 5 → **296,176 now (64×64×32), −18.2 % overall**. That's within **3.3 %** of the hand-written kernel's 286,776.
 - **Same tile as the reference (64×24×64):** 302,677 vs 286,776, **+5.5 %** (was +11 % after Change 5).
+- **K remainder tiles (Change 8):** tiles whose k doesn't divide K no longer compute on padding along K: 64×32×40 drops from 372,777 to **304,577 (−18.3 %)**, as fast as the best dividing tiles.
 
 Each change's own before/after numbers are in its section below.
 
@@ -316,6 +317,58 @@ Correctness: lit test `mlir/test/Conversion/SnitchToLLVM/barrier.mlir`, gvsoc ma
 
 ---
 
+## Change 8: compute the K remainder tile at its real size
+
+**Before.**
+- Change 4 computes M and N remainder tiles at their real size, but K was still zero-padded to the full k, for every remainder strategy. The dual-buffered K loop needs uniform tiles: its two A/B buffer slots are reused by every K step.
+- So a tile whose k doesn't divide K computes FMAs on zeros in the last K step of every output tile. For example, 64×32×40 on 128³ computes 160 instead of 128 along K (+25 %), and 192×384×384 with k = 80 computes 400 instead of 384 (+4.2 %).
+- The padded A/B copies also zero-fill their L1 buffer first (Change 3 made this conditional, but the last K step always needs it).
+- Peeling the last K iteration like M/N (tried first) is correct, but it doesn't work:
+  - The peeled step's A/B buffers are allocated on top of the pipeline's double buffers: L1 = 2·(A+B) + C + A_rem + B_rem. 192×384×384 w32-40-80 then needs 139,264 B and 256³ w128-8-44 needs 143,104 B, over the 112,640-byte budget.
+  - Its copies are issued after the pipeline, not overlapped with compute.
+
+**What changed.**
+- New pass `snitch-split-reduction-remainder` (`mlir/lib/Dialect/Snitch/Transforms/SplitReductionRemainder.cpp`). It runs after accumulator hoisting, when the K loop's step doesn't divide its constant trip range:
+  - The compute op becomes `scf.if (k != last K step) { matmul on the full tiles } else { matmul on tensor.extract_slice's of the same tiles, cut down to the remainder along K }`.
+  - The A/B pads now yield `ub.poison` instead of zero, since the padding is never read. `snitch-promote-pads-to-l1` lowers them to copies with undefined padding, which copy only the valid part and zero-fill nothing.
+- `snitch-pipeline-copy-compute` (`PipelineCopyCompute.cpp`) pipelines a loop whose marked compute op is inside an `scf.if`. It also finds the copies of a compute op through `extract_slice`s of the waited tiles. The slices stay in the compute stage.
+- So the K loop keeps ⌈K/k⌉ uniform steps and the same L1 buffers as before (2·(A+B) + C). The remainder tile's copy is issued during the previous step, like every other copy. The remainder microkernel reads A with the full tile's row stride (e.g. per hart 4×18 with `lda` = 24), which both microkernels support.
+- `run_gemm.py`: `--tiling remainder` (the default) runs the pass when K has a remainder. `GEMM_K_REMAINDER=0` turns it off, which gives the previous behaviour (M/N at real size, K padded).
+- `run_gemm.py` also gained `--tiling pad`. Every remainder tile is zero-padded to the full tile size, with no peeling, but all other changes still apply. This is the padding baseline for the remainder vs padding comparison.
+
+**Why it is faster.** The last K step of every output tile does only its real FMAs: k_rem/k of a full step. It also copies less data and no longer zero-fills.
+
+**Measured.** "K padded" is `--tiling remainder` with `GEMM_K_REMAINDER=0`; "K remainder" is the new default. All runs are pipelined.
+
+| Problem, tile (M×N×K) | K padding | Microkernel | Pad mode | K padded | K remainder | Change |
+|---|---|---|---|---|---|---|
+| 128³, 64×32×40 | 160/128 (+25 %) | library | 372,777 | 372,777 | **304,577** | **−18.3 %** |
+| | | xdsl | 561,276 | 561,276 | 544,276 | −3.0 % |
+| 128³, 64×32×48 | 144/128 (+12.5 %) | library | 340,077 | 340,077 | **304,777** | **−10.4 %** |
+| | | xdsl | 545,177 | 545,177 | 484,977 | −11.0 % |
+| 192×384×384, 32×40×80 | 400/384 (+4.2 %) | library | 4,221,177 | 4,053,877 | **3,891,177** | −4.0 % (−7.8 % vs pad) |
+| | | xdsl | 4,416,277 | 4,244,376 | 4,073,577 | −4.0 % (−7.8 % vs pad) |
+| 256³, 128×8×44 | 264/256 (+3.1 %) | library | 2,719,576 | 2,719,576 | **2,644,076** | −2.8 % |
+| | | xdsl | 2,881,676 | 2,881,676 | 2,854,076 | −1.0 % |
+
+- **Library microkernel: the saving tracks the padded FMAs.**
+  - On 64×32×40 the last K step goes from 11,366 cycles (a full 40-wide step) to 2,871 (8 wide; ideal 2,048 per hart), from `trace_breakdown.py --steps`.
+  - Both 128³ tiles now run in ~304.6k cycles: within 3 % of the best dividing tile (64×64×32, 296,176), at 86 % of the 262,144-cycle ideal.
+- **Pad mode equals "K padded"** wherever M and N divide (128³ and 256³ here), as expected. On 192×384×384, N = 384 with n = 40 leaves a 24-column remainder. Pad mode loses another 4.1 % there to padded N.
+- **The xDSL microkernel gains less on small K remainders (e.g. −3.0 % on 64×32×40).** The cause is its code shape, not the split:
+  - It computes 4 outputs at a time.
+  - Each group of 4 pays ~70 integer instructions of address arithmetic for its 4 `fld`/`fsd` of C, followed by an `frep` of only K iterations.
+  - So its cost per call is ≈ (m·n/4)·(~80 + 4·K) cycles, and the m·n part doesn't shrink with K.
+  - The 8-wide remainder step of 64×32×40 takes 12,831 cycles (was 17,607), ~6× its ideal, and the per-group overhead dominates it. With wider remainders (64×32×48: 32 wide) the xDSL gain matches the library's.
+  - This overhead also explains most of the general xDSL vs library gap (544k vs 305k on the same tile).
+
+Correctness:
+- Lit tests: `mlir/test/Dialect/Snitch/split-reduction-remainder.mlir` (new) and a new case in `pipeline-copy-compute.mlir` (compute ops in an `scf.if`).
+- gvsoc matrix **104/104**: 13 sizes × {remainder, pad} × {pipelined, not} × {xdsl, library}. The sizes are the 9 earlier ones (Changes 4 and 6), plus 128×768×768 w40-24-96, 192×384×384 w32-40-80, 256³ w32-24-32 and 256³ w128-8-44.
+- Verilator verify on all 24 measured runs.
+
+---
+
 ## Where the remaining time goes (after Change 7)
 
 64×64×32 (kernel window 292,017 cycles):
@@ -367,12 +420,12 @@ Every change followed the same loop:
 ### Rules learned the hard way
 
 - **Never use gvsoc cycle counts.** gvsoc is not cycle-accurate; use it only for correctness. All performance numbers come from Verilator.
-- **The performance metric is the `dma` column** of `snitch_cluster/myrtle-experiments/extract_dma_csv.sh`, run on the DMA hart's trace (`out/<config>/verilator/logs/trace_hart_00008.dasm`). It's the same metric `many_gemms.sh` uses for the hand-written kernel.
+- **The performance metric is the `dma` column** of `extractDataFromJsons2.py`, run on the DMA hart's trace (`out/<config>/verilator/logs/trace_hart_00008.dasm`). It's the same metric `many_gemms.sh` uses for the hand-written kernel. `run_gemm.py` computes it after every Verilator run and deletes the trace unless `--keep-trace` is given.
 - **Don't add `mcycle` reads to `kernels/gemm_main.c`.** `gen_trace.py` starts a new trace region at every `mcycle` read, and `extractDataFromJsons2.py` requires the DMA trace to have exactly one region.
-- **`run_gemm.py` argument order is `N M K n m k`**, but tiles are written M×N×K. For the reference tile 64×24×64 (m=64, n=24, k=64) the call is `./run_gemm.py 128 128 128 24 64 64 ...`. Getting this wrong cost one measurement round.
+- **Mind the argument order of older tools.** `run_gemm.py` used to take `N M K n m k` while tiles are written M×N×K, which cost one measurement round. It now takes `MxNxKwm-n-k`, the same order as `many_gemms.sh`; `extract_dma_csv.sh` still takes `M N K m n k`.
 - **gvsoc passing proves little about DMA synchronisation.** The transfer-ID bug passed 32/32 gvsoc runs and failed 3/4 Verilator runs. Any change to the order or overlap of transfers needs Verilator verify runs.
 - **Barriers are not free.** The software barrier cost ~300–400 cycles each (Change 7). Count barriers when estimating a schedule change: with the hardware barrier they're a few cycles.
-- **The output directory name doesn't include the simulator.** Two runs of the same config at once (e.g. a gvsoc correctness run and a Verilator measurement) overwrite each other's files. For concurrent runs, copy `run_gemm.py` with a suffix on `Config.name` (e.g. `_perf`) and pass it to `tools/perf_compare.sh --driver <copy> --suffix _perf`. Delete the copies afterwards.
+- **Same configuration, same output directory.** The directory name includes the tiling mode, pipelining, microkernel and simulator (`gemm_<MxNxKwm-n-k>_<rem|pad>_<pipe|nopipe>_<microkernel>_<simulator>`), but not the `GEMM_*` switches. For a before/after pair of the same configuration, give the "before" run its own `OUT` (e.g. `GEMM_K_REMAINDER=0 OUT=$PWD/out_kpad tools/perf_compare.sh ...`).
 
 ### Commands
 
@@ -382,24 +435,25 @@ The commands below assume `/home/daniel/llvm-project` (the repo root) or `snitch
 |---|---|
 | Build `mlir-opt` (host) | `~/.local/bin/ninja -C build mlir-opt`. `/usr/bin/ninja` on the host is too old. After **adding a source file** to a CMakeLists, first `/usr/local/bin/cmake --regenerate-during-build -S llvm -B build` on the host; the container has no CMake at that path. |
 | Lit tests | `build/bin/llvm-lit mlir/test/Dialect/Snitch mlir/test/Conversion/DMAToLLVM mlir/test/Conversion/SnitchToLLVM` |
-| One run | `cd snitch-backend && docker compose exec -T snitch ./run_gemm.py N M K n m k <pipelined> <gvsoc\|verilator> <xdsl\|library> <verify>` |
-| One Verilator measurement | `tools/perf_compare.sh N M K n m k` (host) prints `dma=<cycles>`. Options: `--driver`/`--suffix`; it forwards `GEMM_STAGGER_N`/`GEMM_PREFETCH`/`GEMM_HW_BARRIER`/`SNITCH_FULL_TRACE`. |
-| Where the kernel time goes | `build/.venv/bin/python3 tools/trace_breakdown.py out/<cfg>/gemm.elf out/<cfg>/verilator/logs/trace_hart_00008.dasm --M 128 --N 128 --K 128 [--steps]`. It prints the kernel window, the compute steps (long barrier waits of the DMA hart) and the sync/fill/drain gaps between them. `--steps` lists every barrier interval. It handles both software (`snrt_partial_barrier`) and hardware (`csrr 0x7c2`) barriers. |
+| One run | `cd snitch-backend && docker compose exec -T snitch ./run_gemm.py <MxNxKwm-n-k> --microkernel <xdsl\|library> --simulator <gvsoc\|verilator> [--tiling remainder\|pad] [--pipelined true\|false] [--verify true\|false] [--keep-trace]` |
+| One Verilator measurement | `tools/perf_compare.sh <MxNxKwm-n-k> [xdsl\|library] [remainder\|pad] [-- run_gemm.py options]` (host) prints `dma=<cycles>`. Option `--driver`; it forwards `GEMM_STAGGER_N`/`GEMM_PREFETCH`/`GEMM_HW_BARRIER`/`GEMM_K_REMAINDER`/`SNITCH_FULL_TRACE`/`OUT`. |
+| Where the kernel time goes | Run with `--keep-trace`, then `build/.venv/bin/python3 tools/trace_breakdown.py out/<cfg>/gemm.elf out/<cfg>/verilator/logs/trace_hart_00008.dasm --M 128 --N 128 --K 128 [--steps]`. It prints the kernel window, the compute steps (long barrier waits of the DMA hart) and the sync/fill/drain gaps between them. `--steps` lists every barrier interval. It handles both software (`snrt_partial_barrier`) and hardware (`csrr 0x7c2`) barriers. |
 | Compute-core profile | `SNITCH_FULL_TRACE=1` selects the Verilator model that traces every hart (`snitch_cluster/target/sim/build-fulltrace`, already built). Then `snitch_cluster/.venv/bin/python3 util/trace/gen_trace.py <trace_hart_0000N.dasm> --mc-exec $PWD/out/snitch-llvm-mc --mc-flags '-disassemble -mcpu=snitch' --dump-hart-perf <json> -o <txt>` inside the container. `gemm_fp64_opt` reads `mcycle` around its compute, so each call is a region. Traces are ~220 MB per hart. |
-| gvsoc correctness matrix | Loop over the sizes in the Change 4 section × `true/false` × `xdsl/library` with `gvsoc ... true`, checking for `[+] verified`: 28 runs. Add the two pipelined configurations of Change 6 (`./run_gemm.py 100 72 90 32 32 24 ...` and `72 100 128 32 32 32 ...`, xdsl and library), which exercise the prefetch with padding: 32 runs. About 1 h sequentially, ~10 min with 8 in parallel. For parallel runs, set `OUT` to a separate directory (`docker compose exec -e OUT=$PWD/out_dev ...`) so they don't overwrite Verilator runs in `out/`. |
+| gvsoc correctness matrix | The sizes of Change 8's matrix × `--tiling remainder/pad` × `--pipelined true/false` × `xdsl/library` with `--simulator gvsoc`, checking for `[+] verified`: 104 runs, ~30 min with 16 in parallel (the 128×768×768 runs take longest). |
 
-Run times: a 128³ Verilator run plus extraction takes ~20–30 min. They can run in parallel (the machine has 80 cores, and simulated cycles don't depend on host load) as long as their output directories differ.
+Run times: a 128³ Verilator run plus extraction takes ~4–7 min (library/xdsl); 256³ ~27–32 min and 192×384×384 ~37–47 min (Change 8 measurements, 24 runs in parallel). They can run in parallel (the machine has 80 cores, and simulated cycles don't depend on host load) as long as their output directories differ.
 
 **Before/after comparisons.** `mlir-opt` is shared by every driver, so a compiler change can't be switched off per run unless it has its own switch. Keep a driver snapshot (copy of `run_gemm.py`) from before a driver-level change, or put compiler changes behind pass options and environment variables, as `GEMM_STAGGER_N`, `GEMM_PREFETCH` and `GEMM_HW_BARRIER` do. To compare against an earlier compiler, copy `build/bin/mlir-opt` before changing it and point a driver copy's `MLIR_OPT` at the copy. That's how the "before" numbers of Changes 6 and 7 were re-measured, and they reproduced the earlier numbers exactly.
 
 ## Current state of the code
 
-None of this is committed yet; it's all uncommitted on branch `autotune-snitch`.
+Changes 1–7 are committed (`c3cb9fff`, branch `autotune-snitch`); Change 8 and the `run_gemm.py` interface changes are not committed yet.
 
 **Compiler** (`mlir/lib/Dialect/...`):
 - `Snitch/Transforms/HoistReductionAccumulator.cpp` (new pass `snitch-hoist-reduction-accumulator`): keeps C in L1 across the K loop (Change 1).
+- `Snitch/Transforms/SplitReductionRemainder.cpp` (new pass `snitch-split-reduction-remainder`): computes the K remainder tile at its real size (Change 8).
 - `Snitch/Transforms/PromoteToL1.cpp`: promotes loop-carried operands at the loop entry.
-- `Snitch/Transforms/PipelineCopyCompute.cpp`: legality check against loop-carried copies.
+- `Snitch/Transforms/PipelineCopyCompute.cpp`: legality check against loop-carried copies. Compute ops in an `scf.if` (Change 8).
 - `Snitch/Transforms/LowerPipelineOp.cpp`: hoists waits ahead of the next copies (`insertConcurrentStages`). Prefetches the next tile's first copy stage across iterations of the enclosing loop (`prepareCrossIterationPrefetch`, `insertNextCopyStage`, option `prefetch-across-iterations`, Change 6).
 - `Snitch/Transforms/SpecializeDMACode.cpp`: one barrier per group of synchronising ops.
 - `Snitch/Transforms/LowerL1Allocations.cpp`: L1 reuse between sequential nests (`assignOffsets`, `mayEscapeBlock`). Inlines `memref.alloca_scope`s once their allocations are lowered.
@@ -418,14 +472,17 @@ None of this is committed yet; it's all uncommitted on branch `autotune-snitch`.
   - staggering default;
   - coalescing of the M/N tile loops and `GEMM_PREFETCH` (Change 6);
   - `hw-barrier` and `GEMM_HW_BARRIER` (Change 7);
-  - `SNITCH_FULL_TRACE`.
+  - `SNITCH_FULL_TRACE`;
+  - `MxNxKwm-n-k` configuration and options, `--tiling remainder|pad`, the K remainder split and `GEMM_K_REMAINDER` (Change 8);
+  - CSV extraction after Verilator runs.
 - `kernels/gemm_main.c` + generated `gemm_data.h`: inputs in `.data`.
 - `kernels/gemm_library_kernel.cpp`: `LDA/LDB/LDC`, `STAGGER_N`.
 - `tools/`.
 
 **Pass order** (`run_gemm.py`):
-1. L1 tiling transform (tile M, N, K with K innermost; peel M/N remainders; pad K, plus M/N to multiples of 8);
+1. L1 tiling transform (tile M, N, K with K innermost; `remainder`: peel M/N remainders, pad K, plus M/N to multiples of 8; `pad`: pad every tile to the full tile size);
 2. `snitch-hoist-reduction-accumulator`;
+   - `snitch-split-reduction-remainder` (`remainder` with a K remainder);
    - coalescing of the marked M/N tile loops (`transform.loop.coalesce`, pipelined only);
 3. `snitch-promote-pads-to-l1`, `snitch-promote-operands-to-l1`;
 4. `snitch-pipeline-copy-compute` (pipelined only);
